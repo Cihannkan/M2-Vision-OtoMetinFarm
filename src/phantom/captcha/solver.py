@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import re
 import threading
@@ -14,6 +15,31 @@ _SCRIPT_DIR = _PROJECT_ROOT
 _RUNTIME_DIR = os.path.join(_PROJECT_ROOT, "runtime")
 _EASYOCR_REQUIRED_MODEL_FILES = ("craft_mlt_25k.pth", "latin_g2.pth")
 _EASYOCR_INIT_LOCK = threading.Lock()
+_RUMELI2_PANEL_MIN_SCORE = 0.18
+_RUMELI2_HEADER_MIN_SCORE = 0.22
+_RUMELI2_CONFIRM_FRAMES = 3
+_RUMELI2_ELIMINATION_MIN_SCORE = 0.36
+_RUMELI2_ELIMINATION_MIN_MARGIN = 0.07
+_RUMELI2_ELIMINATION_CONFIRMATIONS = 2
+_RUMELI2_NEAR_MATCH_MIN_SCORE = 0.24
+_RUMELI2_NEAR_MATCH_MAX_SHAPE_GAP = 0.08
+_RUMELI2_NEAR_MATCH_CONFIRMATIONS = 2
+_RUMELI2_CANDIDATE_MATCH_CONFIRMATIONS = 2
+_RUMELI2_OCR_CONFIRM_WINDOW = 15.0
+_RUMELI2_EVIDENCE_DIR = os.path.join(_RUNTIME_DIR, "evidence", "captcha")
+_CAPTCHA_NON_BLOCKING_STATUSES = {
+    "",
+    "dialog_yok",
+    "rumeli2_kalibrasyon_yok",
+    "rumeli2_referans_yok",
+    "rumeli2_dogrulama",
+    "template_yok",
+}
+
+
+def captcha_status_blocks_input(status):
+    """Configuration/absence statuses must not freeze every game client."""
+    return str(status or "") not in _CAPTCHA_NON_BLOCKING_STATUSES
 
 
 def _is_ssl_cert_error(exc):
@@ -128,17 +154,6 @@ def _patch_easyocr_urlretrieve(cafile=None, insecure=False):
     return True, None
 
 
-def _safe_console_print(text):
-    try:
-        print(text)
-    except UnicodeEncodeError:
-        try:
-            print(str(text).encode("ascii", "replace").decode("ascii"))
-        except Exception:
-            pass
-    except Exception:
-        pass
-
 PUL = ctypes.POINTER(ctypes.c_ulong)
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx",ctypes.c_long),("dy",ctypes.c_long),("mouseData",ctypes.c_ulong),
@@ -156,11 +171,12 @@ def _send_mouse_input(flags):
 
 
 class CaptchaWatcher:
-    def __init__(self, client_id=0, log_cb=None):
+    def __init__(self, client_id=0, log_cb=None, input_lock=None):
         self._client_id = client_id
         self._log_cb    = log_cb   # callable(level:str, msg:str) | None
         self._reader = None
         self._lock = threading.Lock()
+        self._input_lock = input_lock or threading.RLock()
         self._hazir = False
         self._son_cozum = 0.0
         self._cooldown = 1.0
@@ -170,7 +186,39 @@ class CaptchaWatcher:
         self.last_status = "init"
         self.last_detail = ""
         self._last_dialog_log = 0.0
-        self._enabled_tips = {"tip1": False, "tip2": False, "tip3": False, "tip4": False}
+        self._enabled_tips = {
+            "tip1": False,
+            "tip2": False,
+            "tip3": False,
+            "tip4": False,
+            "rumeli2": False,
+        }
+        self._rumeli2_question_region = None
+        self._rumeli2_option_regions = []
+        self._rumeli2_detect_streak = 0
+        self._rumeli2_last_ocr = 0.0
+        self._rumeli2_last_answer_key = ""
+        self._rumeli2_last_answer_t = 0.0
+        self._rumeli2_panel_ref_key = None
+        self._rumeli2_panel_ref_gray = None
+        self._rumeli2_panel_ref_mask = None
+        self._rumeli2_job_lock = threading.Lock()
+        self._rumeli2_job_thread = None
+        self._rumeli2_job_result = None
+        self._rumeli2_job_started = 0.0
+        self._rumeli2_job_generation = 0
+        self._rumeli2_candidate_error = ""
+        self._rumeli2_elimination_key = ""
+        self._rumeli2_elimination_streak = 0
+        self._rumeli2_elimination_last = 0.0
+        self._rumeli2_near_match_key = ""
+        self._rumeli2_near_match_streak = 0
+        self._rumeli2_near_match_last = 0.0
+        self._rumeli2_candidate_match_key = ""
+        self._rumeli2_candidate_match_streak = 0
+        self._rumeli2_candidate_match_last = 0.0
+        self._rumeli2_last_evidence_key = ""
+        self._rumeli2_last_evidence_at = 0.0
         # Captcha template — captcha_template.png varsa yükle
         self._header_tpl      = None   # gri template görüntüsü
         self._header_tpl_path = os.path.join(_SCRIPT_DIR, "templates", "captcha_template", "captcha_template.png")
@@ -350,6 +398,7 @@ class CaptchaWatcher:
         "Expr",                      # diagnoz: math OCR teşhisi
         "ADIM",                      # diagnoz: tıklama/yazma adımları
         "CAPTCHA GORUNTUSU",         # cozum oncesi kontrol kaydi
+        "RUMELI2",                   # Rumeli2 tespit/eslesme diagnozu
     )
 
     def _log(self, level, msg):
@@ -442,9 +491,48 @@ class CaptchaWatcher:
     def set_enabled_tips(self, tips=None):
         tips = tips or {}
         with self._lock:
-            for key in ("tip1", "tip2", "tip3", "tip4"):
+            for key in ("tip1", "tip2", "tip3", "tip4", "rumeli2"):
                 if key in tips:
                     self._enabled_tips[key] = bool(tips[key])
+
+    def set_rumeli2_regions(self, question_region=None, option_regions=None):
+        """Rumeli2 soru ve cevap alanlarini pencereye oranli olarak ayarlar."""
+        question = self._rumeli2_clean_region(question_region)
+        options = []
+        for region in option_regions or []:
+            cleaned = self._rumeli2_clean_region(region)
+            if cleaned is not None:
+                options.append(cleaned)
+        options = options[:4]
+        with self._lock:
+            changed = (
+                question != self._rumeli2_question_region
+                or options != self._rumeli2_option_regions
+            )
+            self._rumeli2_question_region = question
+            self._rumeli2_option_regions = options
+            if changed:
+                self._rumeli2_panel_ref_key = None
+                self._rumeli2_panel_ref_gray = None
+                self._rumeli2_panel_ref_mask = None
+                self._rumeli2_candidate_error = ""
+                with self._rumeli2_job_lock:
+                    self._rumeli2_job_generation += 1
+                    self._rumeli2_job_thread = None
+                    self._rumeli2_job_result = None
+                    self._rumeli2_job_started = 0.0
+
+    @staticmethod
+    def _rumeli2_clean_region(region):
+        try:
+            y1, y2, x1, x2 = [float(v) for v in region]
+        except (TypeError, ValueError):
+            return None
+        y1, y2 = sorted((max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))))
+        x1, x2 = sorted((max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))))
+        if y2 - y1 < 0.003 or x2 - x1 < 0.003:
+            return None
+        return [y1, y2, x1, x2]
 
     def _tip_enabled(self, name):
         with self._lock:
@@ -526,6 +614,25 @@ class CaptchaWatcher:
         if not self._hazir:
             self._set_status("not_ready", self.last_detail)
             return False
+
+        # Rumeli2 dialogu mevcut genel CAPTCHA template'inden farkli oldugu icin
+        # once kalibre edilmis, pencereye oranli alanlar uzerinden aranir.
+        if self._tip_enabled("rumeli2"):
+            rumeli2_result = self._coz_rumeli2_detect(frame, offset_x, offset_y, hwnd)
+            if rumeli2_result is True:
+                self._son_cozum = time.time()
+                return True
+            if rumeli2_result is False:
+                # Dialog goruldu fakat ikinci kare/OCR/eslesme bekleniyor. Bu
+                # sirada genel akisa dusup yanlis bir yere tiklama.
+                return False
+            legacy_enabled = any(
+                self._tip_enabled(name) for name in ("tip1", "tip2", "tip3", "tip4")
+            )
+            if not legacy_enabled:
+                self._set_status("dialog_yok")
+                return False
+
         # GÜVENLİK: Template yüklü değilse captcha tespiti TAMAMEN devre dışı —
         # aksi halde tüm koyu bölgeler captcha olarak algılanabilir.
         if self._header_tpl is None:
@@ -896,6 +1003,925 @@ class CaptchaWatcher:
         self._load_template()
         return self._header_tpl is not None
 
+    @staticmethod
+    def _rumeli2_region_bbox(region, frame_shape):
+        h, w = frame_shape[:2]
+        y1, y2, x1, x2 = region
+        left = max(0, min(w - 1, int(round(x1 * w))))
+        right = max(left + 1, min(w, int(round(x2 * w))))
+        top = max(0, min(h - 1, int(round(y1 * h))))
+        bottom = max(top + 1, min(h, int(round(y2 * h))))
+        return left, top, right, bottom
+
+    @staticmethod
+    def _rumeli2_panel_crop(frame, question_bbox, option_bboxes):
+        """Crop the calibrated dialog area and mask changing codes/countdown."""
+        all_boxes = [question_bbox] + list(option_bboxes)
+        min_x = min(box[0] for box in all_boxes)
+        min_y = min(box[1] for box in all_boxes)
+        max_x = max(box[2] for box in all_boxes)
+        max_y = max(box[3] for box in all_boxes)
+        union_w = max_x - min_x
+        union_h = max_y - min_y
+        frame_h, frame_w = frame.shape[:2]
+        pad_x = max(18, int(union_w * 1.15))
+        pad_y = max(18, int(union_h * 0.45))
+        panel_x1 = max(0, min_x - pad_x)
+        panel_y1 = max(0, min_y - pad_y)
+        panel_x2 = min(frame_w, max_x + pad_x)
+        panel_y2 = min(frame_h, max_y + pad_y)
+        panel = frame[panel_y1:panel_y2, panel_x1:panel_x2]
+        if panel.size == 0:
+            return None, None
+
+        mask = np.full(panel.shape[:2], 255, dtype=np.uint8)
+        margin = max(3, int(round(min(frame_h, frame_w) * 0.004)))
+        for x1, y1, x2, y2 in all_boxes:
+            left = max(0, x1 - panel_x1 - margin)
+            top = max(0, y1 - panel_y1 - margin)
+            right = min(panel.shape[1] - 1, x2 - panel_x1 + margin)
+            bottom = min(panel.shape[0] - 1, y2 - panel_y1 + margin)
+            cv2.rectangle(mask, (left, top), (right, bottom), 0, -1)
+
+        # The countdown below the fourth option changes every second.
+        countdown_top = max(0, max_y - panel_y1 - 2)
+        mask[countdown_top:, :] = 0
+        return panel, mask
+
+    @staticmethod
+    def _rumeli2_panel_similarity(current_panel, current_mask, reference_gray, reference_mask):
+        if (
+            current_panel is None
+            or current_mask is None
+            or reference_gray is None
+            or reference_mask is None
+            or current_panel.size == 0
+        ):
+            return None
+        current_gray = (
+            current_panel
+            if len(current_panel.shape) == 2
+            else cv2.cvtColor(current_panel, cv2.COLOR_BGR2GRAY)
+        )
+        target_size = (reference_gray.shape[1], reference_gray.shape[0])
+        if current_gray.shape != reference_gray.shape:
+            current_gray = cv2.resize(current_gray, target_size, interpolation=cv2.INTER_AREA)
+        if current_mask.shape != reference_mask.shape:
+            current_mask = cv2.resize(current_mask, target_size, interpolation=cv2.INTER_NEAREST)
+        mask = cv2.bitwise_and(current_mask, reference_mask)
+        if np.count_nonzero(mask) < max(64, int(mask.size * 0.10)):
+            return None
+
+        # Pencere kenarlari ve DPI olcegi paneli birkac piksel oynatabilir.
+        # Sabit yazi, cerceve ve tas dokusunu gri ton + kenar uzerinden kucuk
+        # bir kayma toleransi ile karsilastir; renk/hue burada kullanilmaz.
+        pad = max(4, min(12, int(round(min(reference_gray.shape[:2]) * 0.055))))
+        padded_gray = cv2.copyMakeBorder(
+            current_gray,
+            pad,
+            pad,
+            pad,
+            pad,
+            cv2.BORDER_REPLICATE,
+        )
+        try:
+            gray_map = cv2.matchTemplate(
+                    padded_gray,
+                    reference_gray,
+                    cv2.TM_CCOEFF_NORMED,
+                    mask=mask,
+                )
+            gray_values = gray_map[np.isfinite(gray_map)]
+            if gray_values.size == 0:
+                return None
+            gray_score = float(np.max(gray_values))
+
+            current_edges = cv2.Canny(padded_gray, 45, 130)
+            reference_edges = cv2.Canny(reference_gray, 45, 130)
+            edge_map = cv2.matchTemplate(
+                current_edges,
+                reference_edges,
+                cv2.TM_CCORR_NORMED,
+                mask=mask,
+            )
+            edge_values = edge_map[np.isfinite(edge_map)]
+            edge_score = float(np.max(edge_values)) if edge_values.size else 0.0
+            score = (0.75 * gray_score) + (0.25 * edge_score)
+        except Exception:
+            return None
+        if not np.isfinite(score):
+            return None
+        return max(-1.0, min(1.0, score))
+
+    @staticmethod
+    def _rumeli2_header_similarity(current_panel, current_mask, reference_gray, reference_mask):
+        """Compare only the static two-line text and upper panel frame."""
+        if current_panel is None or reference_gray is None:
+            return None
+        current_gray = (
+            current_panel
+            if len(current_panel.shape) == 2
+            else cv2.cvtColor(current_panel, cv2.COLOR_BGR2GRAY)
+        )
+        target_size = (reference_gray.shape[1], reference_gray.shape[0])
+        if current_gray.shape != reference_gray.shape:
+            current_gray = cv2.resize(current_gray, target_size, interpolation=cv2.INTER_AREA)
+        if current_mask.shape != reference_mask.shape:
+            current_mask = cv2.resize(current_mask, target_size, interpolation=cv2.INTER_NEAREST)
+        header_h = max(18, int(round(reference_gray.shape[0] * 0.22)))
+        return CaptchaWatcher._rumeli2_panel_similarity(
+            current_gray[:header_h],
+            current_mask[:header_h],
+            reference_gray[:header_h],
+            reference_mask[:header_h],
+        )
+
+    def _rumeli2_panel_reference(self, question_region, option_regions):
+        client_id = int(getattr(self, "_client_id", 0) or 0)
+        template_dir = os.path.join(_PROJECT_ROOT, "templates", "rumeli2_captcha")
+        candidate_paths = [
+            os.path.join(template_dir, "shared.png"),
+            os.path.join(template_dir, f"client_{client_id}.png"),
+            os.path.join(template_dir, "client_1.png"),
+        ]
+        reference_path = next((path for path in candidate_paths if os.path.exists(path)), None)
+        try:
+            reference_mtime = os.path.getmtime(reference_path) if reference_path else 0.0
+        except OSError:
+            reference_mtime = 0.0
+        key = (
+            tuple(question_region),
+            tuple(tuple(region) for region in option_regions),
+            reference_path,
+            reference_mtime,
+        )
+        if getattr(self, "_rumeli2_panel_ref_key", None) == key:
+            return (
+                getattr(self, "_rumeli2_panel_ref_gray", None),
+                getattr(self, "_rumeli2_panel_ref_mask", None),
+            )
+
+        self._rumeli2_panel_ref_key = key
+        self._rumeli2_panel_ref_gray = None
+        self._rumeli2_panel_ref_mask = None
+        if not reference_path:
+            return None, None
+        reference = cv2.imread(reference_path)
+        if reference is None or reference.size == 0:
+            return None, None
+
+        question_bbox = self._rumeli2_region_bbox(question_region, reference.shape)
+        option_bboxes = [
+            self._rumeli2_region_bbox(region, reference.shape)
+            for region in option_regions
+        ]
+        panel, mask = self._rumeli2_panel_crop(reference, question_bbox, option_bboxes)
+        if panel is None:
+            return None, None
+        self._rumeli2_panel_ref_gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
+        self._rumeli2_panel_ref_mask = mask
+        return self._rumeli2_panel_ref_gray, self._rumeli2_panel_ref_mask
+
+    @staticmethod
+    def _rumeli2_digit_mask(crop, prefer_green=False):
+        """Renkten bagimsiz, hizalanmis rakam silueti uretir."""
+        if crop is None or crop.size == 0:
+            return None
+        if len(crop.shape) == 2:
+            gray = crop
+            bgr = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+        else:
+            bgr = crop
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        mask = None
+        if prefer_green:
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            green = cv2.inRange(hsv, (30, 45, 45), (100, 255, 255))
+            green_ratio = float(np.count_nonzero(green)) / max(float(green.size), 1.0)
+            if green_ratio >= 0.008:
+                mask = green
+
+        if mask is None:
+            smooth = cv2.GaussianBlur(gray, (3, 3), 0)
+            _, mask = cv2.threshold(smooth, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if float(np.count_nonzero(mask)) / max(float(mask.size), 1.0) > 0.55:
+                mask = cv2.bitwise_not(mask)
+
+        # Secim kenari veya arka plan dokusu gibi kucuk parcalari temizle.
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        cleaned = np.zeros_like(mask)
+        min_area = max(2, int(mask.size * 0.0015))
+        min_height = max(2, int(mask.shape[0] * 0.20))
+        kept = 0
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            height = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            if area >= min_area and height >= min_height:
+                cleaned[labels == idx] = 255
+                kept += 1
+        if kept < 1:
+            return None
+
+        points = cv2.findNonZero(cleaned)
+        if points is None:
+            return None
+        x, y, width, height = cv2.boundingRect(points)
+        tight = cleaned[y:y + height, x:x + width]
+        if tight.size == 0:
+            return None
+        ratio = float(np.count_nonzero(tight)) / max(float(tight.size), 1.0)
+        if not (0.04 <= ratio <= 0.92):
+            return None
+        return cv2.resize(tight, (192, 48), interpolation=cv2.INTER_NEAREST)
+
+    @staticmethod
+    def _rumeli2_mask_similarity(first, second):
+        if first is None or second is None or first.shape != second.shape:
+            return 0.0
+        a = first > 0
+        b = second > 0
+        denom = int(np.count_nonzero(a)) + int(np.count_nonzero(b))
+        if denom <= 0:
+            return 0.0
+        dice = (2.0 * float(np.count_nonzero(a & b))) / float(denom)
+        af = first.astype(np.float32) / 255.0
+        bf = second.astype(np.float32) / 255.0
+        corr = float(cv2.matchTemplate(af, bf, cv2.TM_CCOEFF_NORMED)[0][0])
+        corr = max(0.0, min(1.0, corr))
+        return (0.70 * dice) + (0.30 * corr)
+
+    @staticmethod
+    def _rumeli2_ocr_candidates(output):
+        """Extract exact codes and safe six-digit windows from one OCR pass."""
+        parts = [
+            "".join(re.findall(r"\d", str(item)))
+            for item in (output or [])
+        ]
+        parts = [part for part in parts if part]
+        combined = "".join(parts)
+        sequences = list(parts)
+        if combined and combined not in sequences:
+            sequences.append(combined)
+
+        exact = []
+        candidates = []
+        for digits in sequences:
+            if len(digits) == 6:
+                exact.append(digits)
+                candidates.append(digits)
+            elif len(digits) == 7:
+                # EasyOCR sometimes appends one border/noise digit. Keep both
+                # possible six-digit windows; the target comparison decides.
+                candidates.extend((digits[:6], digits[1:]))
+        return list(dict.fromkeys(exact)), list(dict.fromkeys(candidates))
+
+    def _rumeli2_read_digits(self, crop, prefer_green=False, include_candidates=False):
+        mask = self._rumeli2_digit_mask(crop, prefer_green=prefer_green)
+        if mask is None:
+            return ("", []) if include_candidates else ""
+        if len(crop.shape) == 2:
+            gray = crop
+        else:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        variants = [gray, mask, cv2.bitwise_not(mask)]
+        readings = []
+        candidate_votes = {}
+        candidate_order = []
+        with self._lock:
+            reader = self._reader
+            if reader is None:
+                return ("", []) if include_candidates else ""
+            for variant in variants:
+                large = cv2.resize(variant, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+                large = cv2.copyMakeBorder(large, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=0)
+                try:
+                    output = reader.readtext(
+                        large,
+                        detail=0,
+                        paragraph=False,
+                        allowlist="0123456789",
+                    )
+                except TypeError:
+                    output = reader.readtext(large, detail=0, paragraph=False)
+                except Exception:
+                    continue
+                exact, candidates = self._rumeli2_ocr_candidates(output)
+                readings.extend(exact)
+                for digits in candidates:
+                    if digits not in candidate_votes:
+                        candidate_order.append(digits)
+                        candidate_votes[digits] = 0
+                    candidate_votes[digits] += 1
+
+        primary = ""
+        if readings:
+            counts = {digits: readings.count(digits) for digits in set(readings)}
+            best_count = max(counts.values())
+            winners = [digits for digits, count in counts.items() if count == best_count]
+            # Farkli on-isleme yollari esit sayida farkli sonuc veriyorsa ilk
+            # okuma lehine tahmin yapma. Adaylar yine hedefle karsilastirilir.
+            if len(winners) == 1:
+                primary = winners[0]
+
+        candidates = sorted(
+            candidate_order,
+            key=lambda digits: (-candidate_votes[digits], candidate_order.index(digits)),
+        )
+        if include_candidates:
+            return primary, candidates
+        return primary
+
+    def _rumeli2_candidate(self, frame):
+        self._rumeli2_candidate_error = ""
+        with self._lock:
+            question_region = list(self._rumeli2_question_region) if self._rumeli2_question_region else None
+            option_regions = [list(region) for region in self._rumeli2_option_regions]
+        if question_region is None or len(option_regions) != 4:
+            self._rumeli2_candidate_error = "rumeli2_kalibrasyon_yok"
+            return False
+
+        question_bbox = self._rumeli2_region_bbox(question_region, frame.shape)
+        option_bboxes = [self._rumeli2_region_bbox(region, frame.shape) for region in option_regions]
+        qx1, qy1, qx2, qy2 = question_bbox
+        question_crop = frame[qy1:qy2, qx1:qx2]
+        if question_crop.size == 0:
+            return None
+
+        panel, panel_mask = self._rumeli2_panel_crop(
+            frame,
+            question_bbox,
+            option_bboxes,
+        )
+        if panel is None:
+            return None
+        panel_gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
+        dark_ratio = float(np.count_nonzero(panel_gray < 72)) / max(float(panel_gray.size), 1.0)
+        if dark_ratio < 0.45 or float(np.mean(panel_gray)) > 125.0:
+            return None
+
+        reference_gray, reference_mask = self._rumeli2_panel_reference(
+            question_region,
+            option_regions,
+        )
+        if reference_gray is None or reference_mask is None:
+            self._rumeli2_candidate_error = "rumeli2_referans_yok"
+            return False
+        panel_score = self._rumeli2_panel_similarity(
+            panel,
+            panel_mask,
+            reference_gray,
+            reference_mask,
+        )
+        header_score = self._rumeli2_header_similarity(
+            panel,
+            panel_mask,
+            reference_gray,
+            reference_mask,
+        )
+        if (
+            panel_score is None
+            or header_score is None
+            or panel_score < _RUMELI2_PANEL_MIN_SCORE
+            or header_score < _RUMELI2_HEADER_MIN_SCORE
+        ):
+            return None
+
+        # Renk sadece tani koyulduktan sonraki bir teshis degeridir. CAPTCHA
+        # var/yok karari artik yesil piksel oranina dayanmaz.
+        hsv = cv2.cvtColor(question_crop, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, (30, 45, 45), (100, 255, 255))
+        green_ratio = float(np.count_nonzero(green)) / max(float(green.size), 1.0)
+
+        question_mask = self._rumeli2_digit_mask(question_crop, prefer_green=True)
+        if question_mask is None:
+            return None
+        option_crops = []
+        option_masks = []
+        for x1, y1, x2, y2 in option_bboxes:
+            crop = frame[y1:y2, x1:x2]
+            mask = self._rumeli2_digit_mask(crop)
+            if mask is None:
+                return None
+            option_crops.append(crop)
+            option_masks.append(mask)
+        return {
+            "panel_crop": panel.copy(),
+            "question_crop": question_crop,
+            "question_mask": question_mask,
+            "option_crops": option_crops,
+            "option_masks": option_masks,
+            "option_bboxes": option_bboxes,
+            "green_ratio": green_ratio,
+            "dark_ratio": dark_ratio,
+            "panel_score": panel_score,
+            "header_score": header_score,
+        }
+
+    @staticmethod
+    def _rumeli2_elimination_candidate(question_digits, option_digits, scores):
+        """Return the sole unread option only when OCR and shape agree strongly.
+
+        RUMELI2 guarantees one copy of the six-digit target among four choices.
+        We still avoid blind elimination: the target and three alternatives must
+        be complete, none of those alternatives may equal the target, and the
+        one unread row must also be the clear shape winner.
+        """
+        if not re.fullmatch(r"\d{6}", str(question_digits or "")):
+            return None
+        if len(option_digits or []) != 4 or len(scores or []) != 4:
+            return None
+        unread = [
+            idx
+            for idx, digits in enumerate(option_digits)
+            if not re.fullmatch(r"\d{6}", str(digits or ""))
+        ]
+        if len(unread) != 1:
+            return None
+        readable = [str(digits) for digits in option_digits if re.fullmatch(r"\d{6}", str(digits or ""))]
+        if len(readable) != 3 or str(question_digits) in readable:
+            return None
+
+        selected = unread[0]
+        ordered = sorted(range(4), key=lambda idx: float(scores[idx]), reverse=True)
+        if ordered[0] != selected:
+            return None
+        best_score = float(scores[selected])
+        second_score = float(scores[ordered[1]])
+        if (
+            best_score < _RUMELI2_ELIMINATION_MIN_SCORE
+            or best_score - second_score < _RUMELI2_ELIMINATION_MIN_MARGIN
+        ):
+            return None
+        return selected
+
+    def _rumeli2_confirm_elimination(self, question_digits, option_digits, scores):
+        selected = self._rumeli2_elimination_candidate(question_digits, option_digits, scores)
+        now = time.monotonic()
+        key = ""
+        streak = 0
+        if selected is not None:
+            key = f"{question_digits}|{'|'.join(option_digits)}|{selected}"
+        with self._lock:
+            previous_key = getattr(self, "_rumeli2_elimination_key", "")
+            previous_at = float(getattr(self, "_rumeli2_elimination_last", 0.0) or 0.0)
+            if key and key == previous_key and now - previous_at <= _RUMELI2_OCR_CONFIRM_WINDOW:
+                streak = int(getattr(self, "_rumeli2_elimination_streak", 0) or 0) + 1
+            elif key:
+                streak = 1
+            self._rumeli2_elimination_key = key
+            self._rumeli2_elimination_streak = streak
+            self._rumeli2_elimination_last = now if key else 0.0
+        if selected is not None and streak >= _RUMELI2_ELIMINATION_CONFIRMATIONS:
+            return selected, streak
+        return None, streak
+
+    @staticmethod
+    def _rumeli2_hamming_distance(first, second):
+        first = str(first or "")
+        second = str(second or "")
+        if len(first) != 6 or len(second) != 6:
+            return None
+        return sum(left != right for left, right in zip(first, second))
+
+    @classmethod
+    def _rumeli2_near_match_candidate(cls, question_digits, option_digits, scores):
+        """Return one safe OCR candidate that differs in exactly one digit."""
+        target = str(question_digits or "")
+        if not re.fullmatch(r"\d{6}", target):
+            return None
+        if len(option_digits or []) != 4 or len(scores or []) != 4:
+            return None
+
+        readable = []
+        for idx, digits in enumerate(option_digits):
+            value = str(digits or "")
+            if re.fullmatch(r"\d{6}", value):
+                readable.append((idx, value, cls._rumeli2_hamming_distance(target, value)))
+        # Bir bos OCR satirina izin ver; daha az veriyle tahmin yapma.
+        if len(readable) < 3 or any(distance == 0 for _, _, distance in readable):
+            return None
+
+        near = [idx for idx, _, distance in readable if distance == 1]
+        if len(near) != 1:
+            return None
+        selected = near[0]
+        if any(distance < 3 for idx, _, distance in readable if idx != selected):
+            return None
+
+        selected_score = float(scores[selected])
+        best_score = max(float(score) for score in scores)
+        if (
+            selected_score < _RUMELI2_NEAR_MATCH_MIN_SCORE
+            or best_score - selected_score > _RUMELI2_NEAR_MATCH_MAX_SHAPE_GAP
+        ):
+            return None
+        return selected
+
+    def _rumeli2_confirm_near_match(self, question_digits, option_digits, scores):
+        selected = self._rumeli2_near_match_candidate(question_digits, option_digits, scores)
+        now = time.monotonic()
+        key = ""
+        streak = 0
+        if selected is not None:
+            key = f"{question_digits}|{'|'.join(option_digits)}|{selected}"
+        with self._lock:
+            previous_key = getattr(self, "_rumeli2_near_match_key", "")
+            previous_at = float(getattr(self, "_rumeli2_near_match_last", 0.0) or 0.0)
+            if key and key == previous_key and now - previous_at <= _RUMELI2_OCR_CONFIRM_WINDOW:
+                streak = int(getattr(self, "_rumeli2_near_match_streak", 0) or 0) + 1
+            elif key:
+                streak = 1
+            self._rumeli2_near_match_key = key
+            self._rumeli2_near_match_streak = streak
+            self._rumeli2_near_match_last = now if key else 0.0
+        if selected is not None and streak >= _RUMELI2_NEAR_MATCH_CONFIRMATIONS:
+            return selected, streak
+        return None, streak
+
+    @staticmethod
+    def _rumeli2_unpack_digit_reading(reading):
+        if isinstance(reading, tuple) and len(reading) == 2:
+            primary, candidates = reading
+        else:
+            primary, candidates = reading, [reading]
+        primary = str(primary or "")
+        if not re.fullmatch(r"\d{6}", primary):
+            primary = ""
+        cleaned = []
+        for value in candidates or []:
+            value = str(value or "")
+            if re.fullmatch(r"\d{6}", value) and value not in cleaned:
+                cleaned.append(value)
+        if primary and primary not in cleaned:
+            cleaned.insert(0, primary)
+        return primary, cleaned
+
+    @staticmethod
+    def _rumeli2_candidate_ocr_match(question_digits, option_candidates, scores):
+        """Match the target against retained OCR candidates without guessing."""
+        target = str(question_digits or "")
+        if not re.fullmatch(r"\d{6}", target):
+            return None
+        if len(option_candidates or []) != 4 or len(scores or []) != 4:
+            return None
+        matches = [
+            idx
+            for idx, candidates in enumerate(option_candidates)
+            if target in set(str(value or "") for value in (candidates or []))
+        ]
+        if len(matches) != 1:
+            return None
+        selected = matches[0]
+        selected_score = float(scores[selected])
+        best_score = max(float(score) for score in scores)
+        if (
+            selected_score < _RUMELI2_NEAR_MATCH_MIN_SCORE
+            or best_score - selected_score > _RUMELI2_NEAR_MATCH_MAX_SHAPE_GAP
+        ):
+            return None
+        return selected
+
+    def _rumeli2_confirm_candidate_match(self, question_digits, option_candidates, scores):
+        selected = self._rumeli2_candidate_ocr_match(question_digits, option_candidates, scores)
+        now = time.monotonic()
+        key = ""
+        streak = 0
+        if selected is not None:
+            selected_candidates = sorted(
+                set(str(value or "") for value in (option_candidates[selected] or []))
+            )
+            key = f"{question_digits}|{selected}|{','.join(selected_candidates)}"
+        with self._lock:
+            previous_key = getattr(self, "_rumeli2_candidate_match_key", "")
+            previous_at = float(getattr(self, "_rumeli2_candidate_match_last", 0.0) or 0.0)
+            if key and key == previous_key and now - previous_at <= _RUMELI2_OCR_CONFIRM_WINDOW:
+                streak = int(getattr(self, "_rumeli2_candidate_match_streak", 0) or 0) + 1
+            elif key:
+                streak = 1
+            self._rumeli2_candidate_match_key = key
+            self._rumeli2_candidate_match_streak = streak
+            self._rumeli2_candidate_match_last = now if key else 0.0
+        if selected is not None and streak >= _RUMELI2_CANDIDATE_MATCH_CONFIRMATIONS:
+            return selected, streak
+        return None, streak
+
+    def _rumeli2_save_uncertain_evidence(self, candidate, result):
+        """Save one panel crop for a stable uncertain OCR result."""
+        panel = candidate.get("panel_crop")
+        if panel is None or getattr(panel, "size", 0) == 0:
+            return
+        detail = str(result.get("detail") or "belirsiz")
+        now = time.time()
+        with self._lock:
+            previous_key = getattr(self, "_rumeli2_last_evidence_key", "")
+            previous_at = float(getattr(self, "_rumeli2_last_evidence_at", 0.0) or 0.0)
+            if detail == previous_key and now - previous_at < 30.0:
+                return
+            self._rumeli2_last_evidence_key = detail
+            self._rumeli2_last_evidence_at = now
+        try:
+            os.makedirs(_RUMELI2_EVIDENCE_DIR, exist_ok=True)
+            millis = int((now % 1.0) * 1000.0)
+            stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+            stem = f"rumeli2_c{int(self._client_id)}_{stamp}_{millis:03d}"
+            image_path = os.path.join(_RUMELI2_EVIDENCE_DIR, f"{stem}.png")
+            json_path = os.path.join(_RUMELI2_EVIDENCE_DIR, f"{stem}.json")
+            if not cv2.imwrite(image_path, panel):
+                raise OSError("panel PNG yazilamadi")
+            payload = {
+                "epoch": now,
+                "client": int(self._client_id),
+                "question_digits": result.get("question_digits") or "",
+                "option_digits": list(result.get("option_digits") or []),
+                "question_candidates": list(result.get("question_candidates") or []),
+                "option_candidates": [
+                    list(values or []) for values in result.get("option_candidates", [])
+                ],
+                "scores": [round(float(value), 4) for value in result.get("scores", [])],
+                "panel_score": round(float(candidate.get("panel_score", 0.0) or 0.0), 4),
+                "header_score": round(float(candidate.get("header_score", 0.0) or 0.0), 4),
+                "detail": detail,
+            }
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            self._log("warn", f"RUMELI2 belirsiz OCR kaniti kaydedildi: {os.path.basename(image_path)}")
+        except Exception as exc:
+            self._log("warn", f"RUMELI2 OCR kaniti kaydedilemedi: {exc}")
+
+    def _rumeli2_ocr_decision(self, candidate):
+        """Read code crops and decide an option without touching mouse/focus."""
+        question_reading = self._rumeli2_read_digits(
+            candidate["question_crop"],
+            prefer_green=True,
+            include_candidates=True,
+        )
+        option_readings = [
+            self._rumeli2_read_digits(crop, include_candidates=True)
+            for crop in candidate["option_crops"]
+        ]
+        question_digits, question_candidates = self._rumeli2_unpack_digit_reading(question_reading)
+        unpacked_options = [self._rumeli2_unpack_digit_reading(reading) for reading in option_readings]
+        option_digits = [primary for primary, _ in unpacked_options]
+        option_candidates = [candidates for _, candidates in unpacked_options]
+        scores = [
+            self._rumeli2_mask_similarity(candidate["question_mask"], mask)
+            for mask in candidate["option_masks"]
+        ]
+        order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+        best_idx = order[0]
+        best_score = scores[best_idx]
+        second_score = scores[order[1]] if len(order) > 1 else 0.0
+        margin = best_score - second_score
+        exact_matches = [
+            idx for idx, digits in enumerate(option_digits)
+            if question_digits and digits == question_digits
+        ]
+
+        selected = None
+        reason = ""
+        if len(exact_matches) == 1:
+            exact_idx = exact_matches[0]
+            exact_score = scores[exact_idx]
+            # Ayni alti hanenin hedefte ve tek bir secenekte OCR edilmesi ana
+            # kanittir. Renk/font parlakligi sekil skorunu dusurebildigi icin
+            # sekil motorunun yalnizca acikca celismemesini isteriz.
+            if exact_score >= 0.24 and best_score - exact_score <= 0.08:
+                selected = exact_idx
+                best_score = exact_score
+                margin = exact_score - max(
+                    (score for idx, score in enumerate(scores) if idx != exact_idx),
+                    default=0.0,
+                )
+                reason = "ocr+sekil"
+        candidate_match_streak = 0
+        near_match_streak = 0
+        elimination_streak = 0
+        if selected is None:
+            selected, candidate_match_streak = self._rumeli2_confirm_candidate_match(
+                question_digits,
+                option_candidates,
+                scores,
+            )
+            if selected is not None:
+                best_score = scores[selected]
+                margin = best_score - max(
+                    (score for idx, score in enumerate(scores) if idx != selected),
+                    default=0.0,
+                )
+                reason = "iki-kare-aday-ocr+sekil"
+                self._rumeli2_confirm_near_match("", [], [])
+                self._rumeli2_confirm_elimination("", [], [])
+            elif candidate_match_streak:
+                reason = f"aday-ocr-bekle-{candidate_match_streak}/{_RUMELI2_CANDIDATE_MATCH_CONFIRMATIONS}"
+                self._rumeli2_confirm_near_match("", [], [])
+                self._rumeli2_confirm_elimination("", [], [])
+            elif best_score >= 0.90 and margin >= 0.14:
+                selected = best_idx
+                reason = "yuksek-sekil"
+                self._rumeli2_confirm_near_match("", [], [])
+                self._rumeli2_confirm_elimination("", [], [])
+            else:
+                selected, near_match_streak = self._rumeli2_confirm_near_match(
+                    question_digits,
+                    option_digits,
+                    scores,
+                )
+                if selected is not None:
+                    best_score = scores[selected]
+                    margin = best_score - max(
+                        (score for idx, score in enumerate(scores) if idx != selected),
+                        default=0.0,
+                    )
+                    reason = "iki-kare-tek-hane+sekil"
+                    self._rumeli2_confirm_elimination("", [], [])
+                elif near_match_streak:
+                    reason = f"tek-hane-bekle-{near_match_streak}/{_RUMELI2_NEAR_MATCH_CONFIRMATIONS}"
+                    self._rumeli2_confirm_elimination("", [], [])
+                else:
+                    selected, elimination_streak = self._rumeli2_confirm_elimination(
+                        question_digits,
+                        option_digits,
+                        scores,
+                    )
+                    if selected is not None:
+                        best_score = scores[selected]
+                        margin = best_score - max(
+                            (score for idx, score in enumerate(scores) if idx != selected),
+                            default=0.0,
+                        )
+                        reason = "iki-kare-eleme+sekil"
+                    elif elimination_streak:
+                        reason = f"eleme-bekle-{elimination_streak}/{_RUMELI2_ELIMINATION_CONFIRMATIONS}"
+        else:
+            self._rumeli2_confirm_candidate_match("", [], [])
+            self._rumeli2_confirm_near_match("", [], [])
+            self._rumeli2_confirm_elimination("", [], [])
+
+        return {
+            "selected": selected,
+            "question_digits": question_digits,
+            "option_digits": option_digits,
+            "question_candidates": question_candidates,
+            "option_candidates": option_candidates,
+            "scores": scores,
+            "best_score": best_score,
+            "margin": margin,
+            "reason": reason,
+            "candidate_match_streak": candidate_match_streak,
+            "near_match_streak": near_match_streak,
+            "elimination_streak": elimination_streak,
+            "detail": (
+            f"hedef={question_digits or '?'} secenekler={option_digits} "
+            f"hedef_aday={question_candidates} secenek_aday={option_candidates} "
+            f"skor={[round(score, 2) for score in scores]}"
+            + (f" aday={candidate_match_streak}/{_RUMELI2_CANDIDATE_MATCH_CONFIRMATIONS}" if candidate_match_streak else "")
+            + (f" yakin={near_match_streak}/{_RUMELI2_NEAR_MATCH_CONFIRMATIONS}" if near_match_streak else "")
+            + (f" eleme={elimination_streak}/{_RUMELI2_ELIMINATION_CONFIRMATIONS}" if elimination_streak else "")
+            ),
+        }
+
+    def _rumeli2_ocr_worker(self, candidate, generation):
+        try:
+            result = self._rumeli2_ocr_decision(candidate)
+            if result.get("selected") is None:
+                self._rumeli2_save_uncertain_evidence(candidate, result)
+        except Exception as exc:
+            result = {"error": str(exc)[:160]}
+        with self._rumeli2_job_lock:
+            if generation == self._rumeli2_job_generation:
+                self._rumeli2_job_result = result
+
+    def _rumeli2_start_ocr_job(self, candidate):
+        snapshot = {
+            "panel_score": float(candidate.get("panel_score", 0.0) or 0.0),
+            "header_score": float(candidate.get("header_score", 0.0) or 0.0),
+            "question_crop": candidate["question_crop"].copy(),
+            "question_mask": candidate["question_mask"].copy(),
+            "option_crops": [crop.copy() for crop in candidate["option_crops"]],
+            "option_masks": [mask.copy() for mask in candidate["option_masks"]],
+        }
+        panel_crop = candidate.get("panel_crop")
+        if panel_crop is not None and getattr(panel_crop, "size", 0):
+            snapshot["panel_crop"] = panel_crop.copy()
+        with self._rumeli2_job_lock:
+            thread = self._rumeli2_job_thread
+            if thread is not None and thread.is_alive():
+                return False
+            if self._rumeli2_job_result is not None:
+                return False
+            generation = self._rumeli2_job_generation
+            thread = threading.Thread(
+                target=self._rumeli2_ocr_worker,
+                args=(snapshot, generation),
+                name=f"rumeli2-ocr-c{self._client_id}",
+                daemon=True,
+            )
+            self._rumeli2_job_thread = thread
+            self._rumeli2_job_started = time.time()
+            thread.start()
+        return True
+
+    def _rumeli2_take_ocr_result(self):
+        with self._rumeli2_job_lock:
+            thread = self._rumeli2_job_thread
+            if thread is None or thread.is_alive() or self._rumeli2_job_result is None:
+                return None
+            result = self._rumeli2_job_result
+            self._rumeli2_job_thread = None
+            self._rumeli2_job_result = None
+            self._rumeli2_job_started = 0.0
+            return result
+
+    def _rumeli2_discard_finished_job(self):
+        with self._rumeli2_job_lock:
+            thread = self._rumeli2_job_thread
+            if thread is not None and not thread.is_alive():
+                self._rumeli2_job_thread = None
+                self._rumeli2_job_result = None
+                self._rumeli2_job_started = 0.0
+
+    def _coz_rumeli2_detect(self, frame, offset_x=0, offset_y=0, hwnd=None):
+        """None=no dialog, False=dialog var ama bekle/kararsiz, True=tiklandi."""
+        candidate = self._rumeli2_candidate(frame)
+        if candidate is False:
+            self._rumeli2_detect_streak = 0
+            error = self._rumeli2_candidate_error or "rumeli2_kalibrasyon_yok"
+            detail = (
+                "ortak panel referansi gerekli"
+                if error == "rumeli2_referans_yok"
+                else "soru + 4 secenek alani gerekli"
+            )
+            self._set_status(error, detail)
+            self._rumeli2_discard_finished_job()
+            return False
+        if candidate is None:
+            self._rumeli2_detect_streak = 0
+            self._rumeli2_discard_finished_job()
+            return None
+
+        self._rumeli2_detect_streak += 1
+        if self._rumeli2_detect_streak < _RUMELI2_CONFIRM_FRAMES:
+            self._set_status(
+                "rumeli2_dogrulama",
+                f"panel {self._rumeli2_detect_streak}/{_RUMELI2_CONFIRM_FRAMES} kare dogrulaniyor",
+            )
+            return False
+
+        result = self._rumeli2_take_ocr_result()
+        if result is None:
+            with self._rumeli2_job_lock:
+                running = self._rumeli2_job_thread is not None and self._rumeli2_job_thread.is_alive()
+            now = time.time()
+            if not running and now - self._rumeli2_last_ocr >= 1.0:
+                self._rumeli2_last_ocr = now
+                self._rumeli2_start_ocr_job(candidate)
+            self._set_status(
+                "rumeli2_ocr_bekle",
+                f"sabit panel dogrulandi p={candidate['panel_score']:.2f} y={candidate['header_score']:.2f}",
+            )
+            return False
+
+        if result.get("error"):
+            self._set_status("rumeli2_ocr_hata", result["error"])
+            self._log("warn", f"RUMELI2 OCR HATASI — {result['error']}")
+            return False
+
+        detail = (
+            f"{result['detail']} panel={candidate['panel_score']:.2f} "
+            f"yazi={candidate['header_score']:.2f}"
+        )
+        selected = result["selected"]
+        if selected is None:
+            self._set_status("rumeli2_belirsiz", detail[:180])
+            self._log("warn", f"RUMELI2 CAPTCHA ÇÖZÜLEMEDİ — {detail}")
+            return False
+
+        now = time.time()
+        question_digits = result["question_digits"]
+        answer_key = question_digits or str(hash(candidate["question_mask"].tobytes()))
+        if answer_key == self._rumeli2_last_answer_key and now - self._rumeli2_last_answer_t < 5.0:
+            self._set_status("rumeli2_gonderildi", answer_key)
+            return False
+
+        x1, y1, x2, y2 = candidate["option_bboxes"][selected]
+        click_x = int((x1 + x2) / 2) + int(offset_x)
+        click_y = int((y1 + y2) / 2) + int(offset_y)
+        if not self._tikla(click_x, click_y, hwnd, single=True):
+            self._set_status("focus_failed", "rumeli2")
+            return False
+        self._rumeli2_last_answer_key = answer_key
+        self._rumeli2_last_answer_t = time.time()
+        self._set_status("tiklandi", f"rumeli2:{selected + 1}:{question_digits or 'sekil'}")
+        self._log(
+            "success",
+            f"✔ CAPTCHA ÇÖZÜLDÜ — RUMELI2 secenek={selected + 1} "
+            f"hedef={question_digits or '?'} yontem={result['reason']} "
+            f"skor={result['best_score']:.2f} panel={candidate['panel_score']:.2f} "
+            f"yazi={candidate['header_score']:.2f}",
+        )
+        return True
+
     def _coz_tip3_detect(self, frame, offset_x=0, offset_y=0, hwnd=None):
         import random, re
         h, w = frame.shape[:2]
@@ -1042,7 +2068,8 @@ class CaptchaWatcher:
 
         print(f"[CAPTCHA-C{self._client_id}] Tip3 tikla: slot={best_slot} "
               f"hedef='{target}' skor={best_match:.2f} ({click_x},{click_y})")
-        self._tikla(click_x, click_y, hwnd)
+        if not self._tikla(click_x, click_y, hwnd):
+            return False
         self._set_status("tiklandi", f"tip3:slot{best_slot}:{target or 'rastgele'}")
         self._log("success", f"✔ CAPTCHA ÇÖZÜLDÜ — TİP 3 hedef='{target}' slot={best_slot}")
         return True
@@ -1189,7 +2216,8 @@ class CaptchaWatcher:
         hy = int((top_left[1] + bottom_right[1]) / 2.0 / 2.0)
         abs_x = dx1 + hx + offset_x
         abs_y = dy1 + hy + offset_y
-        self._tikla(abs_x, abs_y, hwnd)
+        if not self._tikla(abs_x, abs_y, hwnd):
+            return False
         self._set_status("tiklandi", f"tip1:{target}:{best_score:.2f}")
         self._log("success", f"✔ CAPTCHA ÇÖZÜLDÜ — TİP 1 hedef='{target}' skor={best_score:.2f}")
         return True
@@ -1238,7 +2266,8 @@ class CaptchaWatcher:
             return False
 
         self._log("info", f"Tip1 grid tikla: ({best[0]}, {best[1]}) skor={best_score:.2f} metin={best_text}")
-        self._tikla(best[0], best[1], hwnd)
+        if not self._tikla(best[0], best[1], hwnd):
+            return False
         time.sleep(0.5)
         return True
 
@@ -1369,7 +2398,8 @@ class CaptchaWatcher:
         for cell in different:
             ax = dx1 + cell["cx"] + offset_x
             ay = dy1 + cell["cy"] + offset_y
-            self._tikla(ax, ay, hwnd)
+            if not self._tikla(ax, ay, hwnd):
+                return False
             time.sleep(0.3)
 
         time.sleep(0.5)
@@ -1379,7 +2409,8 @@ class CaptchaWatcher:
         else:
             ox = dx1 + dw // 2 + offset_x
             oy = dy1 + int(dh * 0.86) + offset_y
-        self._tikla(ox, oy, hwnd)
+        if not self._tikla(ox, oy, hwnd):
+            return False
         self._set_status("tiklandi", f"tip2:{len(different)}")
         self._log("success", f"✔ CAPTCHA ÇÖZÜLDÜ — TİP 2 ({len(different)} farklı kare)")
         return True
@@ -1445,11 +2476,14 @@ class CaptchaWatcher:
         abs_iy = input_cy + offset_y
 
         # Input alanına tıkla, cevabı yaz, Enter bas
-        self._tikla(abs_ix, abs_iy, hwnd)
+        if not self._tikla(abs_ix, abs_iy, hwnd):
+            return False
         time.sleep(0.25)
-        self._yaz(str(answer), hwnd)
+        if not self._yaz(str(answer), hwnd):
+            return False
         time.sleep(0.15)
-        self._enter_bas(hwnd)
+        if not self._enter_bas(hwnd):
+            return False
 
         self._set_status("tiklandi", f"tip4:{answer}")
         self._log("success", f"✔ CAPTCHA ÇÖZÜLDÜ — sonuç={answer}")
@@ -1598,12 +2632,15 @@ class CaptchaWatcher:
 
         self._log("info", f"Tip4 ifade='{parsed['expr']}' cevap={answer} input=({ix1},{iy1},{ix2},{iy2})")
 
-        self._tikla(abs_ix, abs_iy, hwnd)
+        if not self._tikla(abs_ix, abs_iy, hwnd):
+            return False
         time.sleep(0.25)
-        self._yaz(str(answer), hwnd)
+        if not self._yaz(str(answer), hwnd):
+            return False
         time.sleep(0.15)
         self._save_tip4_capture_before_send(frame, bbox, offset_x, offset_y, parsed["expr"], answer, tag="tip4")
-        self._enter_bas(hwnd)
+        if not self._enter_bas(hwnd):
+            return False
 
         self._set_status("tiklandi", f"tip4:{parsed['expr']}={answer}")
         self._log("success", f"✔ CAPTCHA ÇÖZÜLDÜ — '{parsed['expr']}' = {answer}")
@@ -2038,23 +3075,27 @@ class CaptchaWatcher:
             # Zamanlamalar uzun: oyun penceresi focus + input field activation
             # için yeterli zaman bırakılır.
             self._log("warn", f"ADIM 1: input tikla ({input_abs_full[0]},{input_abs_full[1]})")
-            self._tikla(input_abs_full[0], input_abs_full[1], hwnd, single=True)
+            if not self._tikla(input_abs_full[0], input_abs_full[1], hwnd, single=True):
+                return False
             time.sleep(0.30)   # focus için yeterli süre
 
             # İkinci emin olma tıklaması (bazı clientlarda ilk click sadece focus, ikincisi cursor)
             self._log("warn", "ADIM 2: input tekrar tikla (focus garanti)")
-            self._tikla(input_abs_full[0], input_abs_full[1], hwnd, single=True)
+            if not self._tikla(input_abs_full[0], input_abs_full[1], hwnd, single=True):
+                return False
             time.sleep(0.25)
 
             self._log("warn", f"ADIM 3: yaz '{answer}'")
-            self._yaz(str(answer), hwnd)
+            if not self._yaz(str(answer), hwnd):
+                return False
             time.sleep(0.35)   # yazma tamamlandıktan sonra Send'e geçmeden önce
             self._save_tip4_capture_before_send(
                 frame, bbox, offset_x, offset_y, parsed["expr"], answer, tag="origins_full"
             )
 
             self._log("warn", f"ADIM 4: Send tikla ({send_abs_full[0]},{send_abs_full[1]})")
-            self._tikla(send_abs_full[0], send_abs_full[1], hwnd, single=True)
+            if not self._tikla(send_abs_full[0], send_abs_full[1], hwnd, single=True):
+                return False
 
             self._set_status("tiklandi", f"origins-full:{parsed['expr']}={answer}")
             self._log(
@@ -2160,18 +3201,21 @@ class CaptchaWatcher:
         )
 
         # 4.1 — Input kutusuna tikla (Focus & Activate)
-        self._tikla(input_abs[0], input_abs[1], hwnd)
+        if not self._tikla(input_abs[0], input_abs[1], hwnd):
+            return False
         time.sleep(_rnd.uniform(0.06, 0.14))
 
         # 4.2 — Cevabi yaz (Data Entry)
-        self._yaz(str(answer), hwnd)
+        if not self._yaz(str(answer), hwnd):
+            return False
         time.sleep(_rnd.uniform(0.18, 0.28))
         self._save_tip4_capture_before_send(
             frame, bbox, offset_x, offset_y, parsed["expr"], answer, tag="origins"
         )
 
         # 4.3 — Send butonu tıkla (Submit)  [send_abs zaten doğrulandı, None olamaz]
-        self._tikla(send_abs[0], send_abs[1], hwnd)
+        if not self._tikla(send_abs[0], send_abs[1], hwnd):
+            return False
         self._set_status("tiklandi", f"origins:{parsed['expr']}={answer}")
         self._log("success", f"✔ CAPTCHA ÇÖZÜLDÜ — '{parsed['expr']}' = {answer} | Send ({send_abs[0]},{send_abs[1]})")
         return True
@@ -2373,6 +3417,26 @@ class CaptchaWatcher:
         self._log("warn", f"Origins: Input fallback ({fx},{fy})")
         return (fx, fy)
 
+    def _focus_window(self, hwnd):
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return False
+        try:
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, 9)
+                time.sleep(0.05)
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            win32gui.SetForegroundWindow(hwnd)
+            deadline = time.time() + 0.35
+            while time.time() < deadline:
+                if win32gui.GetForegroundWindow() == hwnd:
+                    return True
+                time.sleep(0.025)
+            return win32gui.GetForegroundWindow() == hwnd
+        except Exception:
+            return False
+
     def _yaz(self, text, hwnd=None):
         """Metni SendInput klavye olaylarıyla yazar (rakam + eksi için).
 
@@ -2384,52 +3448,51 @@ class CaptchaWatcher:
             '5': 0x35, '6': 0x36, '7': 0x37, '8': 0x38, '9': 0x39,
             '-': 0xBD,  # VK_OEM_MINUS
         }
-        # Focus garanti
-        if hwnd:
-            try:
-                win32gui.ShowWindow(hwnd, 9)
-                win32gui.SetForegroundWindow(hwnd)
+        with self._input_lock:
+            if hwnd and not self._focus_window(hwnd):
+                self._log("warn", f"Client {self._client_id}: captcha yazisi atlandi; pencere odaklanamadi")
+                return False
+            for ch in str(text):
+                vk = VK_MAP.get(ch)
+                if vk is None:
+                    continue
+                # MapVirtualKey ile scan code (bazı clientlar scan code bekler)
+                scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
+                ctypes.windll.user32.keybd_event(vk, scan, 0, 0)            # KEYDOWN
+                time.sleep(0.05)
+                ctypes.windll.user32.keybd_event(vk, scan, 0x0002, 0)       # KEYUP
                 time.sleep(0.08)
-            except Exception:
-                pass
-        for ch in str(text):
-            vk = VK_MAP.get(ch)
-            if vk is None:
-                continue
-            # MapVirtualKey ile scan code (bazı clientlar scan code bekler)
-            scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
-            ctypes.windll.user32.keybd_event(vk, scan, 0, 0)            # KEYDOWN
-            time.sleep(0.05)
-            ctypes.windll.user32.keybd_event(vk, scan, 0x0002, 0)       # KEYUP
-            time.sleep(0.08)
+            return True
 
     def _enter_bas(self, hwnd=None):
         """Enter tuşuna basar."""
-        VK_RETURN = 0x0D
-        ctypes.windll.user32.keybd_event(VK_RETURN, 0, 0, 0)
-        time.sleep(0.05)
-        ctypes.windll.user32.keybd_event(VK_RETURN, 0, 0x0002, 0)
+        with self._input_lock:
+            if hwnd and not self._focus_window(hwnd):
+                self._log("warn", f"Client {self._client_id}: captcha Enter atlandi; pencere odaklanamadi")
+                return False
+            VK_RETURN = 0x0D
+            ctypes.windll.user32.keybd_event(VK_RETURN, 0, 0, 0)
+            time.sleep(0.05)
+            ctypes.windll.user32.keybd_event(VK_RETURN, 0, 0x0002, 0)
+            return True
 
     def _tikla(self, x, y, hwnd=None, single=False):
         """Tıklama — varsayılan çift, single=True ise tek click.
         Input alanları single kullanmalı (çift click focus kaybettirebilir).
         """
-        self._son_tiklama = time.time()
-        if hwnd:
-            try:
-                win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
-                time.sleep(0.05)
-                win32gui.SetForegroundWindow(hwnd)
-                time.sleep(0.1)
-            except:
-                pass
-        ctypes.windll.user32.SetCursorPos(int(x), int(y))
-        time.sleep(0.08)
-        _send_mouse_input(0x0002)   # LMB DOWN
-        time.sleep(0.05)
-        _send_mouse_input(0x0004)   # LMB UP
-        if not single:
-            time.sleep(0.15)
-            _send_mouse_input(0x0002)
+        with self._input_lock:
+            self._son_tiklama = time.time()
+            if hwnd and not self._focus_window(hwnd):
+                self._log("warn", f"Client {self._client_id}: captcha tiklamasi atlandi; pencere odaklanamadi")
+                return False
+            ctypes.windll.user32.SetCursorPos(int(x), int(y))
+            time.sleep(0.08)
+            _send_mouse_input(0x0002)   # LMB DOWN
             time.sleep(0.05)
-            _send_mouse_input(0x0004)
+            _send_mouse_input(0x0004)   # LMB UP
+            if not single:
+                time.sleep(0.15)
+                _send_mouse_input(0x0002)
+                time.sleep(0.05)
+                _send_mouse_input(0x0004)
+            return True

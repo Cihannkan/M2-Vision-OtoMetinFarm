@@ -26,16 +26,54 @@ import tkinter as tk
 from tkinter import filedialog
 
 import torch
-from ultralytics import YOLO
 
-# SHIFT+SOL TIK iÃ§in lock (recursive loop Ã¶nlemek iÃ§in)
+from ..diagnostic_video import DiagnosticVideoRecorder
+from ..vision.directml import create_detection_model, preferred_backend
+from ..vision.survival import detect_death_menu, own_hp_visible, remember_failed_target, filter_failed_targets
+from ..vision.combat import (
+    estimate_red_fill,
+    estimate_scene_motion,
+    filter_targets_away_from,
+    hp_panel_structure_mask,
+    hp_panel_presence_vote,
+    is_credible_hp_bar,
+    is_hp_panel_authoritative,
+    is_plausible_hp_sample,
+    locate_hp_bar,
+    match_hp_panel_anchor,
+    prepare_scene_frame,
+    rank_target_candidates,
+    track_hp_progress,
+)
+from ..automation.buffs import (
+    BUFF_AFTER_ALT_SEQUENCE,
+    BUFF_ALT_ARM_DELAY_SECONDS,
+    BUFF_ALT_SEQUENCE,
+    BUFF_DISMOUNT_DELAY_SECONDS,
+    BUFF_INTERVAL_SECONDS,
+    BUFF_KEY_HOLD_SECONDS,
+)
+from .client_routing import (
+    CLIENT_IDS,
+    duplicate_client_ids,
+    shared_rumeli2_calibration_updates,
+    validate_client_assignment,
+)
+
+# Windows fare/klavye girdileri sistem genelidir. Tum istemci islemleri ayni
+# yeniden-girilebilir kilidi kullanir; boylece odak bir client'tayken baska bir
+# thread o client'a ait tus veya tiklamayi araya sokamaz.
+input_transaction_lock = threading.RLock()
 sol_tik_lock = threading.Lock()
 
 try:
-    from ..captcha.solver import CaptchaWatcher
+    from ..captcha.solver import CaptchaWatcher, captcha_status_blocks_input
     CAPTCHA_OK = True
 except ImportError:
     CAPTCHA_OK = False
+
+    def captcha_status_blocks_input(status):
+        return bool(status and status != "dialog_yok")
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(PACKAGE_DIR, "..", "..", ".."))
@@ -44,11 +82,18 @@ CONFIG_FILE = os.path.join(PROJECT_ROOT, "config_phantom.json")
 HTML_FILE = os.path.join(PROJECT_ROOT, "index.html")
 HP_TEMPLATE_DIR = os.path.join(PROJECT_ROOT, "templates", "hp_templates")
 MESSAGE_TEMPLATE_DIR = os.path.join(PROJECT_ROOT, "templates", "message_templates")
+RUMELI2_CALIBRATION_DIR = os.path.join(PROJECT_ROOT, "templates", "rumeli2_captcha")
 RUNTIME_DIR = os.path.join(PROJECT_ROOT, "runtime")
 LOG_DIR = os.path.join(RUNTIME_DIR, "logs")
 EVIDENCE_DIR = os.path.join(RUNTIME_DIR, "evidence")
+DIAGNOSTIC_VIDEO_DIR = os.path.join(EVIDENCE_DIR, "videos")
 HP_TEMPLATE_SCALES = [1.0, 0.75, 0.50, 0.25]
 HP_TEMPLATE_MIN_SCORE = 0.70
+HP_TEMPLATE_MIN_WIDTH = 8
+HP_PANEL_SEARCH_MARGIN = 12
+HP_PANEL_CONFIRM_FRAMES = 3
+HP_PANEL_CONFIRM_VOTES = 2
+HP_PANEL_MIN_INITIAL_FILL = 0.08
 MESSAGE_TEMPLATE_SCALES = [1.0, 0.90, 0.80, 1.10]
 MESSAGE_TEMPLATE_MIN_SCORE = 0.68
 MESSAGE_REPLY_TEXTS = [
@@ -62,19 +107,15 @@ MESSAGE_REPLY_TEXTS = [
     "dinliyorum",
 ]
 MESSAGE_ACTION_COOLDOWN = 6.0
-MESSAGE_SELF_NAME_PREFIXES = ("vespa",)
-MESSAGE_SELF_ECHO_SECONDS = 3.0
-MESSAGE_SELF_ECHO_SIMILARITY = 0.74
 MESSAGE_OCR_MIN_CONF = 0.20
 MESSAGE_FARM_PAUSE_SECONDS = 0.0
 LOOT_BURST_TAPS = 6
 LOOT_TAP_INTERVAL = 0.08
 LOOT_POST_KILL_DELAY = 0.12
-HEDEF_KUYRUK_BATCH_CLICK_GAP = 0.10
-HEDEF_KUYRUK_HP_CLICK_DELAY = 0.0
-HEDEF_KUYRUK_NO_HP_RESET_SN = 2.0
-HEDEF_KUYRUK_INITIAL_RETRY_SN = 1.5
-HEDEF_KUYRUK_FRAME_MAX_AGE = 1.20
+LOOT_KEY_HOLD_SECONDS = 0.08
+LOOT_KILL_TAPS = 12
+LOOT_KILL_DELAY = 0.55
+LOOT_KILL_INTERVAL = 0.14
 DEFAULT_TARGET_FRAME_MAX_AGE = 1.20
 CAPTCHA_OCR_INIT_GRACE_SECONDS = 3.0
 TARGET_STABLE_RADIUS = 8
@@ -86,25 +127,56 @@ MAX_LOG_FILE_BYTES = 5 * 1024 * 1024
 LOG_RETENTION_DAYS = 7
 EVIDENCE_RETENTION_DAYS = 14
 TERMINAL_HIDDEN_INFO_PREFIXES = (
-    "[LOOT]",
+    "[LOOT] hedef sonrasi",
     "Client 1 captcha status:",
     "Client 2 captcha status:",
+    "Client 3 captcha status:",
 )
 FIXED_CONF_ESIK = 0.50
-FIXED_DOGRULAMA_SN = 1.50
-FIXED_HP_BEKLEME_SN = 0.0
-FIXED_ANTI_STUCK_SN = 15.0
-FIXED_ANTI_HAREKETSIZ_SN = 10.0
+FIXED_DOGRULAMA_SN = 5.0
+FIXED_HP_BEKLEME_SN = 0.80
+FIXED_ANTI_HAREKETSIZ_SN = 4.0
 FIXED_ANTI_KURTARMA_BEKLEME_SN = 3.0
-ANTI_SUCUK_BACK_HOLD_SN = 1.8
-ANTI_SUCUK_BACK_HOLD_REPEAT_SN = 2.35
-ANTI_SUCUK_SIDE_HOLD_MIN_SN = 0.50
-ANTI_SUCUK_SIDE_HOLD_MAX_SN = 0.90
-ANTI_SUCUK_SIDE_HOLD_REPEAT_MIN_SN = 0.80
-ANTI_SUCUK_SIDE_HOLD_REPEAT_MAX_SN = 1.25
-ANTI_SUCUK_REPEAT_WINDOW_SN = 20.0
+SCENE_SAMPLE_INTERVAL_SN = 0.20
+APPROACH_HP_DROP_MIN = 0.018
+APPROACH_HP_DROP_CONFIRM_SN = 0.25
+APPROACH_INITIAL_STILL_SN = 8.0
+APPROACH_NO_PANEL_TIMEOUT_SN = 5.0
+RECOVERY_MOVES = (("d", 2.0), ("a", 4.0), ("d", 6.0))
+# Uc manevra ve aralarindaki hasar kontrolleri icin yeterli sure tani.
+APPROACH_MAX_SN = 45.0
+APPROACH_RECOVERY_MAX = len(RECOVERY_MOVES)
+APPROACH_SPACE_HOLD_SN = 1.0
+APPROACH_POST_RECOVERY_WAIT_SN = 3.0
+APPROACH_BLOCKED_TARGET_SN = 11.0
+VISION_STALE_FRAME_SN = 2.0
+VISION_STALE_LOG_EVERY_SN = 5.0
+# 106 px'lik Rumeli2 cubugunda tek piksel yaklasik %0.94'tur. Eski %1.2
+# esigi iki piksel bekledigi icin dusuk hasarda 6sn'lik sahte takilma uretiyordu.
+COMBAT_HP_PROGRESS_MIN = 0.006
+COMBAT_NO_PROGRESS_SN = 6.0
+COMBAT_POST_RECOVERY_WAIT_SN = 3.0
+COMBAT_RECOVERY_MAX = len(RECOVERY_MOVES)
+# Son gorulen can sifira cok yakinsa panelin kapanmasi olum kanitidir. Daha
+# yuksek canda kaybolan panel belirsizdir; loot veya hedef degisimi uretmez.
+COMBAT_DEATH_LOW_HP_MAX = 0.06
+COMBAT_DEATH_MIN_ABSENT_SAMPLES = 3
+# Ust uste binen oyun pencerelerinde mss alttaki client'in HP paneli yerine
+# ustteki pencerenin piksellerini gorebilir. Kisa kaybi tolere et; sonra hedef
+# client'i odaga alip mevcut kademeli kurtarma dizisini uygula. Uc deneme veya
+# mutlak sure siniri sonunda yanlis kill/loot uretmeden hedefi birak.
+COMBAT_PANEL_LOST_RECOVERY_SN = 6.0
+COMBAT_PANEL_LOST_TIMEOUT_SN = 45.0
+HP_MAX_UPWARD_JUMP = 0.04
+HP_DIAGNOSTIC_INTERVAL_SN = 1.50
+COMBAT_DIAGNOSTIC_INTERVAL_SN = 1.50
+METIN_SEARCH_Q_ATTEMPTS = 4
+METIN_SEARCH_Q_HOLD_SN = 1.0
+METIN_SEARCH_Q_SETTLE_SN = 0.40
+METIN_SEARCH_KEYS = ("q",) * METIN_SEARCH_Q_ATTEMPTS + ("g", "t")
 os.makedirs(HP_TEMPLATE_DIR, exist_ok=True)
 os.makedirs(MESSAGE_TEMPLATE_DIR, exist_ok=True)
+os.makedirs(RUMELI2_CALIBRATION_DIR, exist_ok=True)
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
@@ -152,8 +224,6 @@ def _safe_file_part(text, limit=48):
 def _should_show_terminal_log(level, message):
     lvl = str(level or "").lower()
     msg = str(message or "")
-    if "[KUYRUK]" in msg and lvl not in ("error", "critical", "kritik"):
-        return False
     if lvl == "debug":
         return False
     if lvl in ("error", "critical", "kritik", "warn", "warning"):
@@ -163,13 +233,21 @@ def _should_show_terminal_log(level, message):
     return True
 
 def log_event(state, level, message):
-    entry = {"ts": time.strftime("%H:%M:%S"), "level": level, "message": message}
+    event_epoch = time.time()
+    local_time = time.localtime(event_epoch)
+    milliseconds = int((event_epoch - int(event_epoch)) * 1000)
+    entry = {
+        "ts": f"{time.strftime('%H:%M:%S', local_time)}.{milliseconds:03d}",
+        "epoch": round(event_epoch, 3),
+        "level": level,
+        "message": message,
+    }
     if _should_show_terminal_log(level, message):
         with state.lk:
             state.logs.append(entry)
     try:
         line = dict(entry)
-        line["date"] = time.strftime("%Y-%m-%d")
+        line["date"] = time.strftime("%Y-%m-%d", local_time)
         path = _rotated_log_path()
         with _log_file_lock:
             with open(path, "a", encoding="utf-8") as f:
@@ -248,8 +326,11 @@ PUL = ctypes.POINTER(ctypes.c_ulong)
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx",ctypes.c_long),("dy",ctypes.c_long),("mouseData",ctypes.c_ulong),
                 ("dwFlags",ctypes.c_ulong),("time",ctypes.c_ulong),("dwExtraInfo",PUL)]
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk",ctypes.c_ushort),("wScan",ctypes.c_ushort),
+                ("dwFlags",ctypes.c_ulong),("time",ctypes.c_ulong),("dwExtraInfo",PUL)]
 class INPUT_UNION(ctypes.Union):
-    _fields_ = [("mi",MOUSEINPUT)]
+    _fields_ = [("mi",MOUSEINPUT),("ki",KEYBDINPUT)]
 class INPUT(ctypes.Structure):
     _fields_ = [("type",ctypes.c_ulong),("iu",INPUT_UNION)]
 
@@ -258,6 +339,24 @@ def _send_mouse(flags):
     iu = INPUT_UNION(); iu.mi = MOUSEINPUT(0,0,0,flags,0,ctypes.pointer(_extra))
     cmd = INPUT(0, iu)
     ctypes.windll.user32.SendInput(1, ctypes.pointer(cmd), ctypes.sizeof(cmd))
+
+def _send_keyboard_scancode(scancode, key_up=False):
+    """Windows SendInput ile fiziksel tarama kodu gonder; teslim sayisini dondur."""
+    flags = 0x0008 | (0x0002 if key_up else 0)  # SCANCODE | KEYUP
+    iu = INPUT_UNION()
+    iu.ki = KEYBDINPUT(0, int(scancode), flags, 0, ctypes.pointer(_extra))
+    cmd = INPUT(1, iu)  # INPUT_KEYBOARD
+    try:
+        sent = ctypes.windll.user32.SendInput(1, ctypes.pointer(cmd), ctypes.sizeof(cmd))
+        return int(sent) == 1
+    except Exception:
+        return False
+
+def _send_keyboard_scancode_tap(scancode, delay=0.05):
+    down_ok = _send_keyboard_scancode(scancode, key_up=False)
+    time.sleep(max(0.0, float(delay)))
+    up_ok = _send_keyboard_scancode(scancode, key_up=True)
+    return bool(down_ok and up_ok)
 
 def _sol_tik_sendinput(x, y):
     bx, by = win32api.GetCursorPos()
@@ -311,6 +410,7 @@ _SC = {
     's':     0x1F,
     'a':     0x1E,
     'd':     0x20,
+    'q':     0x10,
     'z':     0x2C,
     'space': 0x39,   # Space bar
 }
@@ -374,8 +474,8 @@ def _ik_send(scancode, state):
         return False
     try:
         s = _IKeyStroke(code=scancode, state=state, information=0)
-        _ilib.interception_send(_icx, _ikdev, ctypes.byref(s), 1)
-        return True
+        sent = _ilib.interception_send(_icx, _ikdev, ctypes.byref(s), 1)
+        return int(sent) == 1
     except Exception:
         return False
 
@@ -498,35 +598,41 @@ _sag_tik_lock = threading.Lock()
 
 def sag_tik_hw(x, y, hwnd=None):
     """SaÄŸ tÄ±k â€” Interception driver yÃ¼klÃ¼yse kernel-level, yoksa SendInput."""
-    if not _sag_tik_lock.acquire(blocking=False):
-        return "blocked"
-    try:
-        if INTERCEPTION_OK and not _force_sendinput:
-            if _sag_tik_interception(x, y):
-                return "interception"
+    with input_transaction_lock:
+        if hwnd and not pencere_odakla(hwnd):
+            return "focus_failed"
+        if not _sag_tik_lock.acquire(blocking=False):
+            return "blocked"
+        try:
+            if INTERCEPTION_OK and not _force_sendinput:
+                if _sag_tik_interception(x, y):
+                    return "interception"
+                _sag_tik_sendinput(x, y)
+                return "sendinput_fallback"
             _sag_tik_sendinput(x, y)
-            return "sendinput_fallback"
-        _sag_tik_sendinput(x, y)
-        return "sendinput"
-    finally:
-        _sag_tik_lock.release()
+            return "sendinput"
+        finally:
+            _sag_tik_lock.release()
 
 _force_sendinput = False  # TÄ±klama modu otomatik: Interception varsa kullanÄ±lÄ±r, yoksa SendInput.
 
 def sol_tik_hw(x, y, hwnd=None):
     """Interception driver yÃ¼klÃ¼yse kernel-level tÄ±klama yapar, yoksa SendInput kullanÄ±r."""
-    if not sol_tik_lock.acquire(blocking=False):
-        return "blocked"
-    try:
-        if INTERCEPTION_OK and not _force_sendinput:
-            if _sol_tik_interception(x, y):
-                return "interception"
+    with input_transaction_lock:
+        if hwnd and not pencere_odakla(hwnd):
+            return "focus_failed"
+        if not sol_tik_lock.acquire(blocking=False):
+            return "blocked"
+        try:
+            if INTERCEPTION_OK and not _force_sendinput:
+                if _sol_tik_interception(x, y):
+                    return "interception"
+                _sol_tik_sendinput(x, y)
+                return "sendinput_fallback"
             _sol_tik_sendinput(x, y)
-            return "sendinput_fallback"
-        _sol_tik_sendinput(x, y)
-        return "sendinput"
-    finally:
-        sol_tik_lock.release()
+            return "sendinput"
+        finally:
+            sol_tik_lock.release()
 
 def sol_tik_hw_shift_callback():
     """SHIFT+LeftClick iÃ§in callback."""
@@ -537,41 +643,47 @@ _shift_tik_lock = threading.Lock()
 
 def shift_sol_tik_hw(x, y, hwnd=None):
     """Shift+Sol tÄ±k."""
-    if not _shift_tik_lock.acquire(blocking=False):
-        return "blocked"
-    try:
-        keyboard.press('shift')
+    with input_transaction_lock:
+        if hwnd and not pencere_odakla(hwnd):
+            return "focus_failed"
+        if not _shift_tik_lock.acquire(blocking=False):
+            return "blocked"
         try:
-            if INTERCEPTION_OK and not _force_sendinput:
-                if _sol_tik_interception(x, y):
-                    return "interception"
+            keyboard.press('shift')
+            try:
+                if INTERCEPTION_OK and not _force_sendinput:
+                    if _sol_tik_interception(x, y):
+                        return "interception"
+                    _sol_tik_sendinput(x, y)
+                    return "sendinput_fallback"
                 _sol_tik_sendinput(x, y)
-                return "sendinput_fallback"
-            _sol_tik_sendinput(x, y)
-            return "sendinput"
+                return "sendinput"
+            finally:
+                keyboard.release('shift')
         finally:
-            keyboard.release('shift')
-    finally:
-        _shift_tik_lock.release()
+            _shift_tik_lock.release()
 
 def shift_sag_tik_hw(x, y, hwnd=None):
     """Shift+SaÄŸ tÄ±k."""
-    if not _shift_tik_lock.acquire(blocking=False):
-        return "blocked"
-    try:
-        keyboard.press('shift')
+    with input_transaction_lock:
+        if hwnd and not pencere_odakla(hwnd):
+            return "focus_failed"
+        if not _shift_tik_lock.acquire(blocking=False):
+            return "blocked"
         try:
-            if INTERCEPTION_OK and not _force_sendinput:
-                if _sag_tik_interception(x, y):
-                    return "interception"
+            keyboard.press('shift')
+            try:
+                if INTERCEPTION_OK and not _force_sendinput:
+                    if _sag_tik_interception(x, y):
+                        return "interception"
+                    _sag_tik_sendinput(x, y)
+                    return "sendinput_fallback"
                 _sag_tik_sendinput(x, y)
-                return "sendinput_fallback"
-            _sag_tik_sendinput(x, y)
-            return "sendinput"
+                return "sendinput"
+            finally:
+                keyboard.release('shift')
         finally:
-            keyboard.release('shift')
-    finally:
-        _shift_tik_lock.release()
+            _shift_tik_lock.release()
 
 def _tiklama_yap(cfg, x, y, hwnd=None):
     """Config'deki tiklama_turu'na gÃ¶re doÄŸru tÄ±klama fonksiyonunu Ã§aÄŸÄ±rÄ±r."""
@@ -601,20 +713,101 @@ def hwnd_al(val):
     try: return int(val.split("(ID: ")[1].replace(")",""))
     except: return None
 
-def pencere_odakla(hwnd):
-    if not hwnd:
-        return
+
+def _diagnostic_video_context(cfg, state):
+    """Build JSON-safe routing state for the timestamp sidecar and overlay."""
     try:
-        # Minimize ise geri aÃ§
-        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        time.sleep(0.05)
+        foreground_hwnd = int(win32gui.GetForegroundWindow() or 0)
+        foreground_title = win32gui.GetWindowText(foreground_hwnd) if foreground_hwnd else ""
+    except Exception:
+        foreground_hwnd = 0
+        foreground_title = ""
+    try:
+        cursor = [int(value) for value in win32api.GetCursorPos()]
+    except Exception:
+        cursor = None
+
+    with state.lk:
+        bot_active = bool(state.aktif)
+        device = str(state.cihaz or "")
+        states = dict(state.durum)
+        target_generations = dict(state.target_generation)
+        vision_data = dict(state.wdata)
+        pause = {
+            "active": bool(state.global_pause_active),
+            "kind": str(state.global_pause_kind or ""),
+            "owner": str(state.global_pause_owner or ""),
+        }
+
+    clients = []
+    for client_id in CLIENT_IDS:
+        client_cfg = cfg.client(client_id)
+        window_key = str(client_cfg.get("pencere", "Yok") or "Yok")
+        hwnd = int(hwnd_al(window_key) or 0)
+        rect = None
+        visible = False
+        iconic = False
+        if hwnd:
+            try:
+                visible = bool(win32gui.IsWindowVisible(hwnd))
+                iconic = bool(win32gui.IsIconic(hwnd))
+                raw_rect = win32gui.GetWindowRect(hwnd)
+                rect = [int(value) for value in raw_rect]
+            except Exception:
+                rect = None
+        data = vision_data.get(window_key, {}) or {}
+        hp_fill = data.get("hp_fill")
+        clients.append({
+            "client": int(client_id),
+            "active": bool(client_cfg.get("aktif", True)),
+            "window": window_key,
+            "hwnd": hwnd,
+            "rect": rect,
+            "visible": visible,
+            "minimized": iconic,
+            "foreground": hwnd != 0 and hwnd == foreground_hwnd,
+            "state": str(states.get(window_key, "BEKLIYOR")),
+            "generation": int(target_generations.get(window_key, 0) or 0),
+            "hp_visible": bool(data.get("hp_var", False)),
+            "hp_fill": None if hp_fill is None else float(hp_fill),
+            "hp_sample_valid": bool(data.get("hp_sample_valid", False)),
+            "hp_anchor_score": float(data.get("hp_anchor_score", 0.0) or 0.0),
+            "hp_bar_score": float(data.get("hp_bar_score", 0.0) or 0.0),
+            "targets": len(data.get("merkezler", []) or []),
+            "frame_epoch": float(data.get("ts", 0.0) or 0.0),
+        })
+    return {
+        "bot_active": bot_active,
+        "device": device,
+        "foreground_hwnd": foreground_hwnd,
+        "foreground_title": str(foreground_title or ""),
+        "cursor": cursor,
+        "global_pause": pause,
+        "clients": clients,
+    }
+
+def pencere_odakla(hwnd):
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+    try:
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        # Minimize ise geri ac.
+        if win32gui.IsIconic(hwnd):
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            time.sleep(0.05)
         # Foreground lock sÃ¼resini 0 yap (baÅŸka pencereye geÃ§iÅŸi zorla)
         ctypes.windll.user32.SystemParametersInfoW(0x2001, 0, None, 0)  # SPI_SETFOREGROUNDLOCKTIMEOUT
         ctypes.windll.user32.AllowSetForegroundWindow(-1)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
-        time.sleep(0.15)
+        deadline = time.time() + 0.35
+        while time.time() < deadline:
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+            time.sleep(0.025)
+        return win32gui.GetForegroundWindow() == hwnd
     except Exception:
-        pass
+        return False
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Config (per-client ayÄ±rÄ±mlÄ±)
@@ -688,28 +881,33 @@ def _normalize_outgoing_text(text):
 
 def _paste_text_and_enter(text, hwnd=None):
     text = _normalize_outgoing_text(text)
-    if hwnd:
-        pencere_odakla(hwnd)
-    if not _clipboard_set_text(text):
-        return False
-    time.sleep(0.08)
-    if _ikdev is not None and INTERCEPTION_OK and not _force_sendinput:
-        _ik_ctrl_tap(_SC['v'], delay=0.05)
-        time.sleep(0.10)
-        _ik_tap(_SC['enter'], delay=0.04)
-    else:
-        keyboard.send('ctrl+v')
-        time.sleep(0.10)
-        keyboard.send('enter')
-    return True
+    with input_transaction_lock:
+        if hwnd and not pencere_odakla(hwnd):
+            return False
+        if not _clipboard_set_text(text):
+            return False
+        time.sleep(0.08)
+        if _ikdev is not None and INTERCEPTION_OK and not _force_sendinput:
+            _ik_ctrl_tap(_SC['v'], delay=0.05)
+            time.sleep(0.10)
+            _ik_tap(_SC['enter'], delay=0.04)
+        else:
+            keyboard.send('ctrl+v')
+            time.sleep(0.10)
+            keyboard.send('enter')
+        return True
 
 def _client_varsayilan():
     return {
         "aktif":True,"pencere":"Yok","conf_esik":FIXED_CONF_ESIK,"oto_loot":True,
         "hp_region":[0.02,0.07,0.30,0.70],"hp_bekleme_sn":FIXED_HP_BEKLEME_SN,"hp_stuck_timeout":20,
+        "hp_fill_region":None,"hp_fill_region_custom":False,
+        "hp_panel_auto":False,"hp_auto_bar_region":None,"hp_panel_calibration_size":None,
         "ignore_radius":35,"captcha":False,"debug_on":True,"message_captcha":True,
         "loot_taps":LOOT_BURST_TAPS,"loot_interval":LOOT_TAP_INTERVAL,"loot_delay":LOOT_POST_KILL_DELAY,
         "captcha_tip1":False,"captcha_tip2":False,"captcha_tip3":False,"captcha_tip4":False,
+        "captcha_rumeli2":False,"rumeli2_question_region":None,"rumeli2_option_regions":[],
+        "rumeli2_calibration_size":None,
         "cember_yaricap":200,
         "cember_aktif":True,
     }
@@ -730,19 +928,22 @@ VARSAYILAN = {
     "captcha_tip2":False,
     "captcha_tip3":False,
     "captcha_tip4":False,
+    "captcha_rumeli2":False,
     "cember_yaricap":200,
     "cember_aktif":True,
     "mesafe_kontrol_aktif":True,
     "anti_sucuk":False,
-    "anti_aranma_aktif":False,
-    "anti_aranma_sn":0,
-    "anti_stuck_sn":FIXED_ANTI_STUCK_SN,
-    "anti_hareketsiz_sn":FIXED_ANTI_HAREKETSIZ_SN,
-    "anti_kurtarma_bekleme_sn":FIXED_ANTI_KURTARMA_BEKLEME_SN,
-    "hedef_kuyruk_aktif":False,
-    "hedef_kuyruk_sayisi":"default",
+    "diagnostic_video_enabled":True,
     "c1":_client_varsayilan(),
     "c2":_client_varsayilan(),
+    "c3":{**_client_varsayilan(), "aktif":False},
+}
+
+SHARED_CLIENT_SETTINGS = {
+    "conf_esik", "dogrulama_sn", "hp_bekleme_sn", "oto_loot",
+    "loot_taps", "loot_interval", "loot_delay", "captcha",
+    "message_captcha", "captcha_tip1", "captcha_tip2", "captcha_tip3",
+    "captcha_tip4", "captcha_rumeli2", "anti_sucuk",
 }
 
 class Cfg:
@@ -753,9 +954,6 @@ class Cfg:
             try:
                 with open(CONFIG_FILE,"r",encoding="utf-8") as f:
                     saved = json.load(f)
-                    if "hedef_kuyruk_aktif" not in saved:
-                        legacy_queue = str(saved.get("hedef_kuyruk_sayisi", "default")).lower()
-                        self.d["hedef_kuyruk_aktif"] = legacy_queue in {"aktif", "true", "1", "on", "2", "3", "4", "5"}
                     for k in saved:
                         if k in self.d and isinstance(self.d[k], dict) and isinstance(saved[k], dict):
                             self.d[k].update(saved[k])
@@ -769,22 +967,29 @@ class Cfg:
         self.d["dogrulama_sn"] = FIXED_DOGRULAMA_SN
         self.d["hp_bekleme_sn"] = FIXED_HP_BEKLEME_SN
         anti_on = bool(self.d.get("anti_sucuk", False))
-        self.d["anti_aranma_aktif"] = False
-        self.d["anti_aranma_sn"] = 0
-        self.d["anti_stuck_sn"] = FIXED_ANTI_STUCK_SN
-        self.d["anti_hareketsiz_sn"] = FIXED_ANTI_HAREKETSIZ_SN
-        self.d["anti_kurtarma_bekleme_sn"] = FIXED_ANTI_KURTARMA_BEKLEME_SN
-        for key in ("c1", "c2"):
+        for stale_key in (
+            "anti_aranma_aktif", "anti_aranma_sn", "anti_stuck_sn",
+            "anti_hareketsiz_sn", "anti_kurtarma_bekleme_sn",
+        ):
+            self.d.pop(stale_key, None)
+        self.d.pop("hedef_kuyruk_aktif", None)
+        self.d.pop("hedef_kuyruk_sayisi", None)
+        for key in (f"c{ci}" for ci in CLIENT_IDS):
             self.d.setdefault(key, _client_varsayilan())
+            for shared_key in SHARED_CLIENT_SETTINGS:
+                if shared_key in self.d:
+                    self.d[key][shared_key] = self.d[shared_key]
             self.d[key]["conf_esik"] = FIXED_CONF_ESIK
             self.d[key]["dogrulama_sn"] = FIXED_DOGRULAMA_SN
             self.d[key]["hp_bekleme_sn"] = FIXED_HP_BEKLEME_SN
             self.d[key]["anti_sucuk"] = anti_on
-            self.d[key]["anti_aranma_aktif"] = False
-            self.d[key]["anti_aranma_sn"] = 0
-            self.d[key]["anti_stuck_sn"] = FIXED_ANTI_STUCK_SN
-            self.d[key]["anti_hareketsiz_sn"] = FIXED_ANTI_HAREKETSIZ_SN
-            self.d[key]["anti_kurtarma_bekleme_sn"] = FIXED_ANTI_KURTARMA_BEKLEME_SN
+            for stale_key in (
+                "anti_aranma_aktif", "anti_aranma_sn", "anti_stuck_sn",
+                "anti_hareketsiz_sn", "anti_kurtarma_bekleme_sn",
+            ):
+                self.d[key].pop(stale_key, None)
+            self.d[key].pop("hedef_kuyruk_aktif", None)
+            self.d[key].pop("hedef_kuyruk_sayisi", None)
 
     def save(self):
         with self.lk:
@@ -811,7 +1016,7 @@ class Cfg:
         self.save()
 
     def client(self, idx):
-        """c1 veya c2 dict dÃ¶ndÃ¼r"""
+        """Istenen istemcinin ayarlarini kopya olarak dondurur."""
         k = f"c{idx}"
         with self.lk:
             self._force_fixed_values()
@@ -825,18 +1030,34 @@ class Cfg:
             self._force_fixed_values()
         self.save()
 
+    def update_clients(self, updates_by_client):
+        """Birden fazla client ayarini tek config yaziminda atomik gunceller."""
+        with self.lk:
+            for idx, data in dict(updates_by_client or {}).items():
+                if idx not in CLIENT_IDS:
+                    continue
+                key = f"c{idx}"
+                if key not in self.d:
+                    self.d[key] = _client_varsayilan()
+                self.d[key].update(dict(data or {}))
+            self._force_fixed_values()
+        self.save()
+
     def update_global(self, data):
-        shared = {"conf_esik", "dogrulama_sn", "hp_bekleme_sn", "oto_loot", "loot_taps", "loot_interval", "loot_delay", "captcha", "message_captcha", "captcha_tip1", "captcha_tip2", "captcha_tip3", "captcha_tip4", "anti_sucuk", "anti_aranma_aktif", "anti_aranma_sn", "anti_stuck_sn", "anti_hareketsiz_sn", "anti_kurtarma_bekleme_sn", "hedef_kuyruk_aktif", "hedef_kuyruk_sayisi"}
         data = dict(data or {})
-        if "hedef_kuyruk_sayisi" in data and "hedef_kuyruk_aktif" not in data:
-            legacy_queue = str(data.get("hedef_kuyruk_sayisi", "default")).lower()
-            data["hedef_kuyruk_aktif"] = legacy_queue in {"aktif", "true", "1", "on", "2", "3", "4", "5"}
+        for stale_key in (
+            "anti_aranma_aktif", "anti_aranma_sn", "anti_stuck_sn",
+            "anti_hareketsiz_sn", "anti_kurtarma_bekleme_sn",
+        ):
+            data.pop(stale_key, None)
+        data.pop("hedef_kuyruk_aktif", None)
+        data.pop("hedef_kuyruk_sayisi", None)
         with self.lk:
             for key, value in data.items():
                 self.d[key] = value
-                if key in shared:
-                    self.d.setdefault("c1", _client_varsayilan())[key] = value
-                    self.d.setdefault("c2", _client_varsayilan())[key] = value
+                if key in SHARED_CLIENT_SETTINGS:
+                    for ci in CLIENT_IDS:
+                        self.d.setdefault(f"c{ci}", _client_varsayilan())[key] = value
             self._force_fixed_values()
         self.save()
 
@@ -849,6 +1070,7 @@ class State:
         self.aktif = False
         self.started_at = 0.0
         self.wdata = {}
+        self.target_hp_evidence = {}
         self.frame_b64 = {}
         self.cihaz = "cpu"
         self.durum = {}
@@ -868,9 +1090,12 @@ class State:
         self.global_pause_since = 0.0
         self.logs = deque(maxlen=500)
         self.target_memory = {}  # w â†’ {"positions": [(x,y),...], "consecutive_found": int, "confirmed": bool, "last_confirmed_pos": (x,y)}
-        self.kill_counts = {}  # c1/c2 -> int; eski pencere anahtarlari fallback olarak desteklenir
-        self.scene_changed_t = {}  # pk â†’ son ekran hareketi zamanÄ± (koordinat bazlÄ± hareketsiz tespiti)
+        self.kill_counts = {}  # c1/c2/c3 -> int; eski pencere anahtarlari fallback olarak desteklenir
         self.message_farm_pause_until = {}
+        # Her basarili hedef tiklamasi bu sayaci artirir. VisionThread kareyi
+        # yakaladigi andaki nesli etiketler; boylece eski hedefin HP ornekleri
+        # yeni hedefin can gecmisine karisamaz.
+        self.target_generation = {}
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Aksiyon Thread
@@ -891,24 +1116,23 @@ class ActionThread(threading.Thread):
         self._loot_log_t = {}
         self._loot_running = {}
         self._son_tiklama_zamani = {}
-        self._son_hedef = {}
-        self._hedef_blacklist = {}
-        self._hedef_kuyruk = {}
-        self._hedef_kuyruk_click_t = {}
-        self._hedef_kuyruk_stable_log_t = {}
-        self._hedef_kuyruk_fresh_log_t = {}
-        self._queue_prev_targets = {}
         self._default_fresh_log_t = {}
-        self._queue_model_cache = {}
         self._araniyor_baslat_t = {}
-        self._hareketsiz_baslat_t = {}
         self._son_manevra_t = {}
-        self._takilma_baslat_t = {}
         self._s_basmis = {}
-        self._hareketsiz_basmis = {}   # per-window: manevra sÄ±rasÄ±nda re-entry engelle
-        self._son_hareket_t = {}       # per-window: son gerÃ§ek hareket zamanÄ±
         self._anti_sucuk_diag_t = {}
-        self._ad_basmis = False
+        self._approach = {}
+        self._approach_diag_t = {}
+        self._approach_blocked_target = {}
+        self._stale_frame_diag_t = {}
+        self._combat_progress = {}
+        self._target_generation = {}
+        self._last_target_sample = {}
+        self._combat_diag_t = {}
+        self._buff_next_t = {}
+        self._buff_running = {}
+        self._buff_needs_remount = {}
+        self._buff_diag_t = {}
 
     def stop(self):
         self._stop_event.set()
@@ -923,7 +1147,7 @@ class ActionThread(threading.Thread):
             ci = int(client_idx)
         except (TypeError, ValueError):
             return None
-        return f"c{ci}" if ci in (1, 2) else None
+        return f"c{ci}" if ci in CLIENT_IDS else None
 
     def _record_kill(self, w, client_idx=None):
         key = self._kill_count_key(client_idx) or w
@@ -932,13 +1156,380 @@ class ActionThread(threading.Thread):
         with self.st.lk:
             self.st.kill_counts[key] = self.st.kill_counts.get(key, 0) + 1
 
-    def _input_blocked(self, w=None):
+    def _input_blocked(self, w=None, allow_revive=False):
         with self.st.lk:
             if self._stop_event.is_set() or not self.st.aktif:
                 return True
+            # CAPTCHA veya mesaj cevabi ekranda oldugunda fare/klavye sadece
+            # ilgili watcher tarafindan kullanilir. Diger client aksiyonlari
+            # pencere odagini arada degistiremez.
+            if self.st.captcha_global_active or self.st.message_global_active:
+                return True
             if w is not None and self.st.captcha_block.get(w, False):
                 return True
+            if w is not None and not allow_revive:
+                life = getattr(self.st, "life_data", {}).get(w, {})
+                if life.get("visible") or w in getattr(self, "_revive_state", {}):
+                    return True
         return False
+
+    def _handle_player_life(self, w, hwnd, client_idx):
+        if not hasattr(self, "_revive_state"):
+            self._revive_state = {}
+        with self.st.lk:
+            life = dict(getattr(self.st, "life_data", {}).get(w, {}))
+        now = time.time()
+        ts = float(life.get("ts", 0))
+        pending = self._revive_state.get(w)
+        if not life.get("visible") and pending is None:
+            return False
+        if pending is None:
+            pending = self._revive_state[w] = {"seen": 0, "absent": 0, "tries": 0, "next": now, "last": 0}
+            log_event(self.st, "warn", f"[CAN-C{client_idx}] karakter olum menusu goruldu; islemler durdu ({w})")
+        self.dur[w] = "YENIDEN DOGMA"
+        with self.st.lk:
+            self.st.durum[w] = "YENIDEN DOGMA"
+        if ts <= pending["last"] or now - ts > VISION_STALE_FRAME_SN or life.get("hwnd") != hwnd:
+            return True
+        if not life.get("foreground", True):
+            # Occluded pixels say nothing about this client's life/menu state.
+            # Keep the cursor timer, buff checkpoint and alive counter intact.
+            if now < max(pending["next"], pending.get("focus_retry_at", 0)):
+                return True
+            refreshed = self._refresh_revive_life(w, hwnd)
+            if refreshed is None:
+                pending["focus_retry_at"] = time.time() + 2
+                return True
+            life = refreshed
+            ts = float(life["ts"])
+            if life.get("confirmed_alive"):
+                pending["absent"] = 2  # Three fresh foreground captures below.
+        pending["last"] = ts
+        if life.get("visible"):
+            pending.pop("buffs_done", None)
+            pending.pop("buff_step", None)
+            pending.pop("mounted", None)
+            pending.pop("pre_buff_move_remaining", None)
+            pending.pop("pre_buff_dismounted", None)
+            pending["seen"] += 1
+            pending["absent"] = 0
+            if pending["seen"] < 2 or now < pending["next"]:
+                return True
+            if self._input_blocked(w, allow_revive=True) or self.st.global_pause_active:
+                return True
+            # Focus and capture again under the same input lock; never click stale coordinates.
+            with input_transaction_lock:
+                if not hwnd or not win32gui.IsWindow(hwnd) or not pencere_odakla(hwnd):
+                    pending["next"] = now + 3
+                    return True
+                if (self._stop_event.wait(.2) or self._input_blocked(w, allow_revive=True)
+                        or self.st.global_pause_active):
+                    return True
+                try:
+                    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                    with mss.mss() as capture:
+                        frame = cv2.cvtColor(np.array(capture.grab({"left": left, "top": top,
+                            "width": right-left, "height": bottom-top})), cv2.COLOR_BGRA2BGR)
+                    check = detect_death_menu(frame)
+                    if not check.get("visible") or win32gui.GetForegroundWindow() != hwnd:
+                        pending.pop("cursor_centered", None)
+                        pending["next"] = now + 3
+                        return True
+                    if not pending.get("cursor_centered"):
+                        win32api.SetCursorPos(((left + right) // 2, (top + bottom) // 2))
+                        pending["cursor_centered"] = True
+                        pending["next"] = time.time() + 10
+                        log_event(self.st, "info", f"[CAN-C{client_idx}] imlec pencere merkezine tasindi; tiklama oncesi 10sn bekleniyor ({w})")
+                        return True
+                    x, y = check["button"]
+                    if not self._move_revive_cursor(w, hwnd, (left + x, top + y)):
+                        pending.pop("cursor_centered", None)
+                        return True
+                    log_event(self.st, "info", f"[CAN-C{client_idx}] imlec yeniden basla uzerinde; tiklama oncesi 2sn bekleniyor ({w})")
+                    if not self._wait_revive_hover(w, hwnd, (left + x, top + y)):
+                        pending.pop("cursor_centered", None)
+                        return True
+                    if win32gui.GetWindowRect(hwnd) != (left, top, right, bottom):
+                        pending.pop("cursor_centered", None)
+                        return True
+                    with mss.mss() as capture:
+                        frame = cv2.cvtColor(np.array(capture.grab({"left": left, "top": top,
+                            "width": right-left, "height": bottom-top})), cv2.COLOR_BGRA2BGR)
+                    final_check = detect_death_menu(frame)
+                    if (not final_check.get("visible")
+                            or max(abs(a-b) for a, b in zip(final_check.get("button", (0, 0)), (x, y))) > 4
+                            or self._input_blocked(w, allow_revive=True) or self.st.global_pause_active
+                            or win32gui.GetForegroundWindow() != hwnd):
+                        pending.pop("cursor_centered", None)
+                        return True
+                    if not self._wiggle_revive_cursor(w, hwnd, (left + x, top + y)):
+                        pending.pop("cursor_centered", None)
+                        return True
+                    mode = "wiggle_clicks"
+                except Exception as exc:
+                    pending.pop("cursor_centered", None)
+                    log_event(self.st, "warn", f"[CAN-C{client_idx}] yeniden dogma kontrol hatasi: {exc}")
+                    pending["next"] = now + 3
+                    return True
+            pending.pop("cursor_centered", None)
+            pending["next"] = time.time()
+            if mode not in ("blocked", "focus_failed"):
+                pending["tries"] += 1
+                log_event(self.st, "warn", f"[CAN-C{client_idx}] Burada yeniden basla tiklandi (deneme {pending['tries']}); menu kalirsa merkez ve 10sn bekleme tekrarlanacak")
+            return True
+        pending.pop("cursor_centered", None)
+        pending["absent"] = pending["absent"] + 1 if life.get("own_hp") else 0
+        if pending["absent"] < 3 or now < pending["next"]:
+            return True
+        if not pending.get("buffs_done"):
+            if not self._prepare_revive_buffs(w, hwnd, pending):
+                pending["next"] = time.time() + 3
+                return True
+            if not self._restore_revive_buffs(w, hwnd, pending):
+                pending["next"] = time.time() + 3
+                return True
+            pending["buffs_done"] = True
+            log_event(self.st, "info", f"[CAN-C{client_idx}] yeniden dogma guclendirme tuslari gonderildi ({w})")
+        if not pending.get("mounted"):
+            if self._revive_buff_blocked(w):
+                return True
+            if not self._mount_after_revive(w, hwnd):
+                pending["next"] = now + 3
+                return True
+            pending["mounted"] = True
+            self._buff_needs_remount[w] = False
+            log_event(self.st, "info", f"[CAN-C{client_idx}] yeniden dogma sonrasi CTRL+G binis gonderildi ({w})")
+        self._clear_approach(w)
+        self._clear_combat_progress(w)
+        self._hp_onceki_durum.pop(w, None)
+        self._hp_kayip_t.pop(w, None)
+        getattr(self, "_kilitli_hedef", {}).pop(w, None)
+        self._hp_ignore_until[w] = float("inf")
+        self._approach_blocked_target.pop(w, None)
+        getattr(self, "_failed_targets", {}).pop(w, None)
+        self._start_target_generation(w, client_idx, now)
+        with self.st.lk:
+            self.st.target_memory.pop(w, None)
+        self._revive_state.pop(w, None)
+        self.dur[w] = "ARANIYOR"
+        self._araniyor_baslat_t[w] = now
+        # Avoid an immediate dismount/remount from the buff cycle after mounting.
+        self._buff_next_t[w] = time.time() + BUFF_INTERVAL_SECONDS
+        log_event(self.st, "info", f"[CAN-C{client_idx}] yeniden dogma dogrulandi; eski hedef temizlendi ({w})")
+        return True
+
+    def _refresh_revive_life(self, w, hwnd):
+        """Briefly own focus and collect fresh life evidence, never click here."""
+        with input_transaction_lock:
+            if (self._input_blocked(w, allow_revive=True) or self.st.global_pause_active
+                    or not hwnd or not win32gui.IsWindow(hwnd) or not pencere_odakla(hwnd)):
+                return None
+            try:
+                rect = win32gui.GetWindowRect(hwnd)
+                left, top, right, bottom = rect
+                alive = 0
+                with mss.mss() as capture:
+                    for _ in range(3):
+                        if (self._stop_event.wait(.2) or self._input_blocked(w, allow_revive=True)
+                                or self.st.global_pause_active or win32gui.GetForegroundWindow() != hwnd
+                                or win32gui.GetWindowRect(hwnd) != rect):
+                            return None
+                        frame = cv2.cvtColor(np.array(capture.grab({"left": left, "top": top,
+                            "width": right-left, "height": bottom-top})), cv2.COLOR_BGRA2BGR)
+                        life = detect_death_menu(frame)
+                        life.update(ts=time.time(), hwnd=hwnd, own_hp=own_hp_visible(frame), foreground=True)
+                        if win32gui.GetForegroundWindow() != hwnd:
+                            return None
+                        if life.get("visible"):
+                            break
+                        alive = alive + 1 if life["own_hp"] else 0
+                life["confirmed_alive"] = alive == 3
+                with self.st.lk:
+                    if not hasattr(self.st, "life_data"):
+                        self.st.life_data = {}
+                    if float(self.st.life_data.get(w, {}).get("ts", 0)) <= life["ts"]:
+                        self.st.life_data[w] = dict(life)
+                return life
+            except Exception as exc:
+                log_event(self.st, "warn", f"[CAN] odakli yeniden dogma kontrolu basarisiz: {exc} ({w})")
+                return None
+
+    def _move_revive_cursor(self, w, hwnd, position, click_midway=False):
+        """Move to the revive button over ~0.6 seconds, without clicking."""
+        start_x, start_y = win32api.GetCursorPos()
+        for step in range(1, 31):
+            if (self._stop_event.wait(.02) or self._input_blocked(w, allow_revive=True)
+                    or self.st.global_pause_active or win32gui.GetForegroundWindow() != hwnd):
+                return False
+            fraction = step / 30.0
+            fraction = fraction * fraction * (3 - 2 * fraction)
+            point = (
+                round(start_x + (position[0] - start_x) * fraction),
+                round(start_y + (position[1] - start_y) * fraction),
+            )
+            win32api.SetCursorPos(point)
+            if click_midway and step == 15:
+                if not self._click_revive_at(w, hwnd, point):
+                    return False
+        return True
+
+    def _click_revive_at(self, w, hwnd, point):
+        # A previous click can dismiss the menu; never send the next one blindly.
+        if (self._input_blocked(w, allow_revive=True) or self.st.global_pause_active
+                or win32gui.GetForegroundWindow() != hwnd):
+            return False
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        with mss.mss() as capture:
+            frame = cv2.cvtColor(np.array(capture.grab({"left": left, "top": top,
+                "width": right-left, "height": bottom-top})), cv2.COLOR_BGRA2BGR)
+        check = detect_death_menu(frame)
+        if not check.get("visible"):
+            return False
+        x, y = check["button"]
+        if abs(point[0] - left - x) > 12 or abs(point[1] - top - y) > 6:
+            return False
+        if (self._input_blocked(w, allow_revive=True) or self.st.global_pause_active
+                or win32gui.GetForegroundWindow() != hwnd):
+            return False
+        return sol_tik_hw(*point, hwnd) not in ("blocked", "focus_failed")
+
+    def _wiggle_revive_cursor(self, w, hwnd, position):
+        """Small horizontal sweep inside the button, ending at its center."""
+        x, y = position
+        for offset in (8, -8, 0):
+            if not self._move_revive_cursor(w, hwnd, (x + offset, y), click_midway=offset != 0):
+                return False
+        return True
+
+    def _wait_revive_hover(self, w, hwnd, position):
+        # Keep the shared input lock at the caller only during this short hover.
+        # The preceding ten-second wait remains non-blocking for other clients.
+        for _ in range(40):
+            if (self._stop_event.wait(.05) or self._input_blocked(w, allow_revive=True)
+                    or self.st.global_pause_active or win32gui.GetForegroundWindow() != hwnd):
+                return False
+            cursor = win32api.GetCursorPos()
+            if max(abs(a-b) for a, b in zip(cursor, position)) > 3:
+                return False
+        return True
+
+    def _revive_buff_blocked(self, w):
+        if self._input_blocked(w, allow_revive=True) or self.st.global_pause_active:
+            return True
+        with self.st.lk:
+            life = dict(getattr(self.st, "life_data", {}).get(w, {}))
+        return bool(life.get("visible") or not life.get("own_hp")
+                    or time.time() - float(life.get("ts", 0)) > VISION_STALE_FRAME_SN)
+
+    def _prepare_revive_buffs(self, w, hwnd, pending):
+        """Revival is already mounted: move right, then dismount before buffs."""
+        if pending.get("pre_buff_dismounted"):
+            return True
+        with input_transaction_lock:
+            if self._revive_buff_blocked(w) or not hwnd or not pencere_odakla(hwnd):
+                return False
+            remaining = float(pending.get("pre_buff_move_remaining", 3.0))
+            if remaining > 0:
+                if self._revive_buff_blocked(w) or win32gui.GetForegroundWindow() != hwnd:
+                    return False
+                started = time.monotonic()
+                try:
+                    keyboard.press("d")
+                    completed = self._wait_revive_buff(w, remaining)
+                finally:
+                    keyboard.release("d")
+                    pending["pre_buff_move_remaining"] = max(0, remaining - (time.monotonic() - started))
+                if not completed:
+                    return False
+                pending["pre_buff_move_remaining"] = 0
+                log_event(self.st, "info", f"[CAN] guclendirme oncesi D 3sn tamamlandi ({w})")
+            if self._revive_buff_blocked(w) or not self._mount_after_revive(w, hwnd):
+                return False
+            pending["pre_buff_dismounted"] = True
+            log_event(self.st, "info", f"[CAN] guclendirme oncesi CTRL+G inis gonderildi ({w})")
+            return self._wait_revive_buff(w, .2)
+
+    def _restore_revive_buffs(self, w, hwnd, pending):
+        """Restore buffs on foot, checkpointing sent keys; mount is a separate step."""
+        steps = list(BUFF_ALT_SEQUENCE) + list(BUFF_AFTER_ALT_SEQUENCE)
+        with input_transaction_lock:
+            if self._revive_buff_blocked(w) or not hwnd or not pencere_odakla(hwnd):
+                return False
+            alt_pressed = False
+            try:
+                start = int(pending.get("buff_step", 0))
+                if start < len(BUFF_ALT_SEQUENCE):
+                    keyboard.press("alt")
+                    alt_pressed = True
+                    if not self._wait_revive_buff(w, BUFF_ALT_ARM_DELAY_SECONDS):
+                        return False
+                for index in range(start, len(steps)):
+                    if index == len(BUFF_ALT_SEQUENCE) and alt_pressed:
+                        keyboard.release("alt")
+                        alt_pressed = False
+                    if self._revive_buff_blocked(w) or win32gui.GetForegroundWindow() != hwnd:
+                        return False
+                    key, delay_after, _label = steps[index]
+                    try:
+                        keyboard.press(key)
+                        # Never repeat a sent toggle if a later wait is interrupted.
+                        pending["buff_step"] = index + 1
+                        if not self._wait_revive_buff(w, BUFF_KEY_HOLD_SECONDS):
+                            return False
+                    finally:
+                        keyboard.release(key)
+                    if delay_after and not self._wait_revive_buff(w, delay_after):
+                        return False
+                return True
+            finally:
+                if alt_pressed:
+                    keyboard.release("alt")
+
+    def _wait_revive_buff(self, w, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._stop_event.wait(min(.05, max(0, deadline - time.time()))):
+                return False
+            if self._revive_buff_blocked(w):
+                return False
+        return not self._revive_buff_blocked(w)
+
+    def _mount_after_revive(self, w, hwnd):
+        """Send one mount toggle after confirmed revival; always release keys."""
+        with input_transaction_lock:
+            if self._input_blocked(w, allow_revive=True) or self.st.global_pause_active:
+                return False
+            if not hwnd or not win32gui.IsWindow(hwnd) or not pencere_odakla(hwnd):
+                return False
+            pressed = []
+            sent = False
+            try:
+                if self._input_blocked(w, allow_revive=True):
+                    return False
+                keyboard.press("ctrl")
+                pressed.append("ctrl")
+                keyboard.press("g")
+                pressed.append("g")
+                sent = True
+                self._stop_event.wait(BUFF_KEY_HOLD_SECONDS)
+            finally:
+                for key in reversed(pressed):
+                    try:
+                        keyboard.release(key)
+                    except Exception:
+                        pass
+            # Once sent, a stop request must not cause a second toggle on resume.
+            return sent
+
+    def _remember_target_failure(self, w, now):
+        if not hasattr(self, "_failed_targets"):
+            self._failed_targets = {}
+        history = self._failed_targets.setdefault(w, [])
+        remember_failed_target(history, getattr(self, "_kilitli_hedef", {}).get(w), now)
+
+    def _filter_target_failures(self, w, targets, now):
+        history = getattr(self, "_failed_targets", {}).get(w, [])
+        return filter_failed_targets(targets, history, now)
 
     def _anti_sucuk_log_throttled(self, w, reason, message, now=None, interval=3.0):
         now = now or time.time()
@@ -952,22 +1543,8 @@ class ActionThread(threading.Thread):
         if state in ("DOGRULAMA", "CAPTCHA", "CAPTCHA BEKLE", "MESAJ", "MESAJ BEKLE"):
             return False
         if hp_var:
-            return state in ("SAVASIYOR", "KUYRUK")
-        return state in ("ARANIYOR", "KUYRUK", "SAVASIYOR")
-
-    def _hedef_kuyruk_aktif(self):
-        raw = self.cfg.g("hedef_kuyruk_aktif")
-        if raw is not None:
-            if isinstance(raw, str):
-                return raw.strip().lower() in {"aktif", "true", "1", "on", "yes"}
-            return bool(raw)
-        legacy = str(self.cfg.g("hedef_kuyruk_sayisi") or "default").lower()
-        return legacy in {"aktif", "true", "1", "on", "2", "3", "4", "5"}
-
-    def _queue_state_key(self, w, client_idx=None):
-        if client_idx:
-            return f"C{client_idx}:{w}"
-        return str(w)
+            return state == "SAVASIYOR"
+        return state in ("ARANIYOR", "SAVASIYOR")
 
     def _hp_bitis_gecikmesi(self, cc):
         return FIXED_HP_BEKLEME_SN
@@ -976,195 +1553,413 @@ class ActionThread(threading.Thread):
         now = time.time() if now is None else now
         self._son_tiklama_t[w] = now - self._hp_bitis_gecikmesi(cc)
 
-    def _clear_hedef_kuyruk(self, w, client_idx=None):
-        keys = [self._queue_state_key(w, client_idx)] if client_idx else [str(w)]
-        if client_idx is None:
-            suffix = f":{w}"
-            keys.extend(k for k in list(self._hedef_kuyruk.keys()) if str(k).endswith(suffix))
-            keys.extend(k for k in list(self._hedef_kuyruk_click_t.keys()) if str(k).endswith(suffix))
-        for key in set(keys):
-            self._hedef_kuyruk.pop(key, None)
-            self._hedef_kuyruk_click_t.pop(key, None)
-        self._queue_prev_targets.pop((w, "fresh"), None)
+    def _begin_approach(self, w, now=None):
+        now = time.time() if now is None else now
+        self._approach[w] = {
+            "started": now,
+            "max_fill": None,
+            "drop_since": 0.0,
+            "still_since": 0.0,
+            "recoveries": 0,
+            "check_after": now,
+            "warned_no_fill": False,
+        }
 
-    def _hedef_kuyruk_merkez_yaricap(self, cc):
+    def _start_target_generation(self, w, client_idx=None, now=None):
+        """Yeni tiklanan hedef icin HP zaman serisini atomik olarak ayir."""
+        now = time.time() if now is None else float(now)
+        with self.st.lk:
+            generation = int(self.st.target_generation.get(w, 0) or 0) + 1
+            self.st.target_generation[w] = generation
+            self.st.target_hp_evidence.pop(w, None)
+        self._target_generation[w] = generation
+        self._last_target_sample.pop(w, None)
+        label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+        log_event(
+            self.st,
+            "debug",
+            f"[HP-{label}] yeni hedef G{generation}; eski HP ornekleri gecersiz ({w})",
+        )
+        return generation
+
+    def _target_sample_is_new(self, w, generation, sample_ts):
+        """Ayni Vision karesinin 50 Hz aksiyon dongusunde tekrar islenmesini engelle."""
+        if not hasattr(self, "_target_generation"):
+            self._target_generation = {}
+        if not hasattr(self, "_last_target_sample"):
+            self._last_target_sample = {}
         try:
-            base = float((cc or {}).get("ignore_radius", 35) or 35)
-            return max(90.0, base * 2.5)
-        except Exception:
-            return 90.0
+            sample_generation = int(generation or 0)
+            sample_time = float(sample_ts or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if sample_time <= 0:
+            # Dogrudan cagiran eski test/entegrasyonlar icin uyumluluk. Canli
+            # dongu her zaman Vision kare zamanini gonderir.
+            sample_time = time.time()
+        expected = int(self._target_generation.get(w, sample_generation) or 0)
+        self._target_generation.setdefault(w, expected)
+        if sample_generation != expected:
+            return False
+        token = (sample_generation, sample_time)
+        if self._last_target_sample.get(w) == token:
+            return False
+        self._last_target_sample[w] = token
+        return True
 
-    def _target_xy(self, target):
-        if isinstance(target, dict):
-            return float(target.get("x", target.get("cx", 0))), float(target.get("y", target.get("cy", 0)))
-        return float(target[0]), float(target[1])
+    def _clear_approach(self, w):
+        self._approach.pop(w, None)
 
-    def _queue_target_xy(self, target):
-        if isinstance(target, dict) and target.get("box"):
-            b1, b2, b3, b4 = target["box"]
-            w_box = max(1, int(b3) - int(b1))
-            h_box = max(1, int(b4) - int(b2))
-            x = int((int(b1) + int(b3)) / 2)
-            y = int(int(b2) + h_box * 0.56)
-            return float(max(int(b1) + 3, min(int(b3) - 3, x))), float(max(int(b2) + 3, min(int(b4) - 3, y)))
-        return self._target_xy(target)
+    def _begin_combat_progress(self, w, hp_fill=None, now=None, damage_confirmed=False):
+        now = time.time() if now is None else now
+        if not hasattr(self, "_last_damage_t"):
+            self._last_damage_t = {}
+        if damage_confirmed:
+            self._last_damage_t[w] = now
+        initial = None if hp_fill is None else float(hp_fill)
+        self._combat_progress[w] = {
+            "hp_floor": initial,
+            "start_fill": initial,
+            "last_fill": initial,
+            "last_progress": now,
+            "started": now,
+            "samples": 1 if initial is not None else 0,
+            "progress_events": 0,
+            "damage_confirmed": bool(damage_confirmed),
+            "recoveries": 0,
+            "check_after": now,
+            "missing_samples": 0,
+            "missing_started": 0.0,
+        }
+
+    def _clear_combat_progress(self, w):
+        self._combat_progress.pop(w, None)
+        if hasattr(self, "_combat_diag_t"):
+            self._combat_diag_t.pop(w, None)
+
+    def _combat_log_throttled(self, w, client_idx, progress, hp_fill, now, force=False):
+        if not getattr(self, "st", None):
+            return
+        if not hasattr(self, "_combat_diag_t"):
+            self._combat_diag_t = {}
+        if not hasattr(self, "_target_generation"):
+            self._target_generation = {}
+        last = float(self._combat_diag_t.get(w, 0) or 0)
+        if not force and now - last < COMBAT_DIAGNOSTIC_INTERVAL_SN:
+            return
+        self._combat_diag_t[w] = now
+        floor = progress.get("hp_floor")
+        fill_text = "--" if hp_fill is None else f"{float(hp_fill) * 100:.1f}"
+        floor_text = "--" if floor is None else f"{float(floor) * 100:.1f}"
+        progress_age = now - float(progress.get("last_progress", now) or now)
+        generation = int(self._target_generation.get(w, 0) or 0)
+        label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+        log_event(
+            self.st,
+            "debug",
+            f"[SAVAS-{label}] G{generation} can=%{fill_text} taban=%{floor_text} "
+            f"ilerlemesiz={progress_age:.1f}sn ornek={int(progress.get('samples', 0) or 0)} "
+            f"olay={int(progress.get('progress_events', 0) or 0)} "
+            f"hasar={'evet' if progress.get('damage_confirmed') else 'hayir'} "
+            f"kurtarma={int(progress.get('recoveries', 0) or 0)}/{COMBAT_RECOVERY_MAX} ({w})",
+        )
+
+    def _approach_log_throttled(self, w, reason, message, now=None, interval=2.0):
+        now = time.time() if now is None else now
+        key = (w, reason)
+        last = float(self._approach_diag_t.get(key, 0) or 0)
+        if now - last >= interval:
+            self._approach_diag_t[key] = now
+            log_event(self.st, "debug", message)
+
+    def _recovery_input_blocked(self, w):
+        if self._input_blocked(w):
+            return True
+        with self.st.lk:
+            return bool(self.st.global_pause_active)
+
+    def _hold_recovery_key(self, w, key, seconds, hwnd=None):
+        with input_transaction_lock:
+            pressed = False
+            try:
+                if self._recovery_input_blocked(w):
+                    return False
+                if hwnd and not pencere_odakla(hwnd):
+                    log_event(self.st, "warn", f"Tus atlandi: hedef pencere odaklanamadi ({w})")
+                    return False
+                keyboard.press(key)
+                pressed = True
+                deadline = time.time() + max(0.0, float(seconds))
+                while time.time() < deadline:
+                    if self._stop_event.wait(min(0.05, max(0.0, deadline - time.time()))):
+                        return False
+                    if self._recovery_input_blocked(w):
+                        return False
+                return True
+            finally:
+                if pressed:
+                    try:
+                        keyboard.release(key)
+                    except Exception:
+                        pass
+
+    def _wait_buff_delay(self, w, seconds):
+        deadline = time.time() + max(0.0, float(seconds))
+        while time.time() < deadline:
+            if self._stop_event.wait(min(0.05, max(0.0, deadline - time.time()))):
+                return False
+            if self._recovery_input_blocked(w):
+                return False
+        return True
+
+    def _tap_buff_hotkey(self, w, keys, hwnd=None):
+        with input_transaction_lock:
+            pressed = []
+            try:
+                if self._recovery_input_blocked(w):
+                    return False
+                if hwnd and not pencere_odakla(hwnd):
+                    log_event(self.st, "warn", f"BUFF atlandi: hedef pencere odaklanamadi ({w})")
+                    return False
+                for key in keys:
+                    keyboard.press(key)
+                    pressed.append(key)
+                return self._wait_buff_delay(w, BUFF_KEY_HOLD_SECONDS)
+            finally:
+                for key in reversed(pressed):
+                    try:
+                        keyboard.release(key)
+                    except Exception:
+                        pass
+
+    def _buff_log_throttled(self, w, reason, message, interval=5.0):
+        now = time.time()
+        key = (w, reason)
+        if now - float(self._buff_diag_t.get(key, 0) or 0) >= interval:
+            self._buff_diag_t[key] = now
+            log_event(self.st, "debug", message)
+
+    def _run_held_alt_buff_sequence(self, w, hwnd):
+        # ALT basili kalirken baska client'a gecilirse tuslar karisabilir;
+        # bu diziyi tek bir input islemi olarak tamamla.
+        with input_transaction_lock:
+            alt_pressed = False
+            try:
+                if self._recovery_input_blocked(w):
+                    return False
+                if hwnd and not pencere_odakla(hwnd):
+                    log_event(self.st, "warn", f"BUFF atlandi: hedef pencere odaklanamadi ({w})")
+                    return False
+                keyboard.press("alt")
+                alt_pressed = True
+                log_event(
+                    self.st,
+                    "debug",
+                    f"[BUFF] ALT basili; ilk tus oncesi {BUFF_ALT_ARM_DELAY_SECONDS:.0f}sn bekleniyor ({w})",
+                )
+                if not self._wait_buff_delay(w, BUFF_ALT_ARM_DELAY_SECONDS):
+                    return False
+                log_event(self.st, "debug", f"[BUFF] ALT basili; 1 2 3 4 F1 F2 F3 gonderiliyor ({w})")
+
+                for key, delay_after, label in BUFF_ALT_SEQUENCE:
+                    if not self._tap_buff_hotkey(w, (key,), hwnd):
+                        log_event(self.st, "warn", f"[BUFF] {label} sirasinda ertelendi ({w})")
+                        return False
+                    if delay_after and not self._wait_buff_delay(w, delay_after):
+                        log_event(self.st, "warn", f"[BUFF] {label} sonrasinda ertelendi ({w})")
+                        return False
+                return True
+            finally:
+                if alt_pressed:
+                    try:
+                        keyboard.release("alt")
+                    except Exception:
+                        pass
+
+    def _run_buff_cycle(self, w, hwnd):
+        if not hwnd or self._recovery_input_blocked(w):
+            return False
+        if self._loot_running.get(w, False):
+            self._buff_log_throttled(w, "loot", f"[BUFF] loot bitene kadar ertelendi ({w})")
+            return False
+        if self._buff_running.get(w, False):
+            return False
+
+        self._buff_running[w] = True
+        completed = False
+        try:
+            if not pencere_odakla(hwnd):
+                log_event(self.st, "warn", f"[BUFF] hedef pencere odaklanamadi ({w})")
+                return False
+            if self._recovery_input_blocked(w):
+                return False
+
+            if self._buff_needs_remount.get(w, False):
+                log_event(self.st, "warn", f"[BUFF] yarim kalan dongu: once ata biniliyor ({w})")
+                if not self._tap_buff_hotkey(w, ("ctrl", "g"), hwnd):
+                    return False
+                self._buff_needs_remount[w] = False
+                log_event(self.st, "info", f"[BUFF] yarim kalan dongu icin CTRL+G binis gonderildi ({w})")
+                if not self._wait_buff_delay(w, 0.20):
+                    return False
+
+            with self.st.lk:
+                self.st.durum[w] = "GUCLENDIRME"
+            log_event(self.st, "info", f"[BUFF] guclendirme dongusu basladi ({w})")
+
+            # Ilk CTRL+G karakteri attan indirir. Dongu yarida kesilirse
+            # sonraki guvenli denemede once ata binmek gerekir.
+            self._buff_needs_remount[w] = True
+            if not self._tap_buff_hotkey(w, ("ctrl", "g"), hwnd):
+                log_event(self.st, "warn", f"[BUFF] ilk CTRL+G sirasinda ertelendi ({w})")
+                return False
+            log_event(self.st, "info", f"[BUFF] ilk CTRL+G inis gonderildi ({w})")
+            if not self._wait_buff_delay(w, BUFF_DISMOUNT_DELAY_SECONDS):
+                return False
+
+            if not self._run_held_alt_buff_sequence(w, hwnd):
+                return False
+
+            for key, delay_after, label in BUFF_AFTER_ALT_SEQUENCE:
+                if not self._tap_buff_hotkey(w, (key,), hwnd):
+                    log_event(self.st, "warn", f"[BUFF] {label} sirasinda ertelendi ({w})")
+                    return False
+                if delay_after and not self._wait_buff_delay(w, delay_after):
+                    return False
+
+            if not self._tap_buff_hotkey(w, ("ctrl", "g"), hwnd):
+                log_event(self.st, "warn", f"[BUFF] son CTRL+G sirasinda ertelendi ({w})")
+                return False
+            self._buff_needs_remount[w] = False
+            log_event(self.st, "info", f"[BUFF] son CTRL+G binis gonderildi ({w})")
+
+            completed = True
+            log_event(
+                self.st,
+                "info",
+                f"[BUFF] tamamlandi; sonraki dongu {BUFF_INTERVAL_SECONDS / 60:.0f} dakika sonra ({w})",
+            )
+            return True
+        except Exception as exc:
+            log_event(self.st, "error", f"[BUFF] tus dizisi hatasi: {exc} ({w})")
+            return False
+        finally:
+            self._buff_running[w] = False
+            if not completed:
+                pending = "; CTRL+G binis bekliyor" if self._buff_needs_remount.get(w, False) else ""
+                self._buff_log_throttled(w, "deferred", f"[BUFF] guvenli ana ertelendi{pending} ({w})")
+
+    def _run_approach_recovery(self, w, hwnd, attempt):
+        if not 1 <= attempt <= len(RECOVERY_MOVES):
+            return False
+        move_key, move_seconds = RECOVERY_MOVES[attempt - 1]
+        if self._recovery_input_blocked(w):
+            return False
+        if not pencere_odakla(hwnd):
+            log_event(self.st, "warn", f"Yaklasma kurtarmasi: hedef pencere odaklanamadi ({w})")
+            return False
+        if self._recovery_input_blocked(w):
+            return False
+        log_event(
+            self.st,
+            "warn",
+            f"Yaklasma kurtarmasi {attempt}/{APPROACH_RECOVERY_MAX}: SPACE {APPROACH_SPACE_HOLD_SN:.0f}sn + {move_key.upper()} {move_seconds:.0f}sn ({w})",
+        )
+        if not self._hold_recovery_key(w, "space", APPROACH_SPACE_HOLD_SN, hwnd):
+            log_event(self.st, "warn", f"Yaklasma kurtarmasi SPACE sirasinda iptal edildi ({w})")
+            return False
+        if self._stop_event.wait(0.08) or self._recovery_input_blocked(w):
+            return False
+        if not self._hold_recovery_key(w, move_key, move_seconds, hwnd):
+            log_event(self.st, "warn", f"Yaklasma kurtarmasi {move_key.upper()} sirasinda iptal edildi ({w})")
+            return False
+        log_event(self.st, "info", f"Yaklasma kurtarmasi tamamlandi; hareket/hasar yeniden kontrol ediliyor ({w})")
+        return True
+
+    def _run_combat_recovery(self, w, hwnd):
+        if self._recovery_input_blocked(w):
+            return False
+        if not pencere_odakla(hwnd):
+            log_event(self.st, "warn", f"Savas kurtarmasi: hedef pencere odaklanamadi ({w})")
+            return False
+        if self._recovery_input_blocked(w):
+            return False
+        progress = self._combat_progress.get(w) or {}
+        last_fill = progress.get("last_fill")
+        hp_floor = progress.get("hp_floor")
+        fill_text = "--" if last_fill is None else f"{float(last_fill) * 100:.1f}"
+        floor_text = "--" if hp_floor is None else f"{float(hp_floor) * 100:.1f}"
+        no_progress = time.time() - float(progress.get("last_progress", time.time()) or time.time())
+        attempt = int(progress.get("recoveries", 0) or 0) + 1
+        if not 1 <= attempt <= len(RECOVERY_MOVES):
+            return False
+        move_key, move_seconds = RECOVERY_MOVES[attempt - 1]
+        log_event(
+            self.st,
+            "warn",
+            f"Savas ilerlemiyor: can=%{fill_text}, taban=%{floor_text}, "
+            f"{no_progress:.1f}sn yeni dusus yok; kurtarma {attempt}/{COMBAT_RECOVERY_MAX}: "
+            f"SPACE {APPROACH_SPACE_HOLD_SN:.0f}sn + {move_key.upper()} {move_seconds:.0f}sn ({w})",
+        )
+        if not self._hold_recovery_key(w, "space", APPROACH_SPACE_HOLD_SN, hwnd):
+            log_event(self.st, "warn", f"Savas kurtarmasi SPACE sirasinda iptal edildi ({w})")
+            return False
+        if self._stop_event.wait(0.08) or self._recovery_input_blocked(w):
+            return False
+        if not self._hold_recovery_key(w, move_key, move_seconds, hwnd):
+            log_event(self.st, "warn", f"Savas kurtarmasi {move_key.upper()} sirasinda iptal edildi ({w})")
+            return False
+        log_event(self.st, "info", f"Savas kurtarmasi tamamlandi; can ilerlemesi yeniden kontrol ediliyor ({w})")
+        return True
+
+    def _abandon_approach_target(self, w, cc, now, reason):
+        self._remember_target_failure(w, now)
+        locked = getattr(self, "_kilitli_hedef", {}).get(w)
+        if locked:
+            self._approach_blocked_target[w] = {
+                "pos": (float(locked[0]), float(locked[1])),
+                # Metin-yok sayaci ve dort Q taramasi tamamlanana kadar ayni
+                # hedefi yeniden secme.
+                "until": now + APPROACH_BLOCKED_TARGET_SN,
+            }
+        self._clear_approach(w)
+        self._clear_combat_progress(w)
+        self._hp_ignore_until[w] = float("inf")
+        self._hp_onceki_durum.pop(w, None)
+        self._hp_kayip_t.pop(w, None)
+        self._son_tiklama_t[w] = now
+        self.dur[w] = "ARANIYOR"
+        log_event(
+            self.st,
+            "warn",
+            f"Yaklasma birakildi: {reason}; hedef {APPROACH_BLOCKED_TARGET_SN:.0f}sn beklemeye alindi ({w})",
+        )
+
+    def _abandon_combat_target(self, w, cc, now, reason):
+        self._remember_target_failure(w, now)
+        locked = getattr(self, "_kilitli_hedef", {}).get(w)
+        if locked:
+            self._approach_blocked_target[w] = {
+                "pos": (float(locked[0]), float(locked[1])),
+                "until": now + APPROACH_BLOCKED_TARGET_SN,
+            }
+        self._clear_combat_progress(w)
+        self._hp_ignore_until[w] = float("inf")
+        self._hp_onceki_durum.pop(w, None)
+        self._hp_kayip_t.pop(w, None)
+        self._son_tiklama_t[w] = now
+        self._araniyor_baslat_t.pop(w, None)
+        self.dur[w] = "ARANIYOR"
+        log_event(
+            self.st,
+            "warn",
+            f"Savas hedefi birakildi: {reason}; hedef {APPROACH_BLOCKED_TARGET_SN:.0f}sn beklemeye alindi ({w})",
+        )
 
     def _target_center_xy(self, target):
         if isinstance(target, dict):
             return float(target.get("cx", target.get("x", 0))), float(target.get("cy", target.get("y", 0)))
         return float(target[0]), float(target[1])
-
-    def _filter_stable_queue_targets(self, key, targets, now=None):
-        now = time.time() if now is None else now
-        prev = self._queue_prev_targets.get(key) or {}
-        prev_ts = float(prev.get("ts", 0.0) or 0.0)
-        prev_centers = prev.get("centers") or []
-        frame_gap_ok = bool(prev_centers) and (now - prev_ts) <= TARGET_STABLE_MAX_FRAME_GAP
-        stable = []
-        for target in targets or []:
-            cx, cy = self._target_center_xy(target)
-            dist = min((np.hypot(cx - px, cy - py) for px, py in prev_centers), default=999999.0)
-            stable_click = frame_gap_ok and dist <= TARGET_STABLE_RADIUS
-            if isinstance(target, dict):
-                target["stable_click"] = bool(stable_click)
-                target["stable_distance"] = float(dist if dist < 999999.0 else 0.0)
-            if stable_click:
-                stable.append(target)
-        self._queue_prev_targets[key] = {
-            "ts": now,
-            "centers": [self._target_center_xy(target) for target in targets or []],
-        }
-        return stable
-
-    def _refresh_hedef_kuyruk_target(self, target, live_targets, ecx, ecy, exclude_center_radius=0, blacklist=None):
-        if not target or not live_targets:
-            return None
-        old_cx, old_cy = self._target_center_xy(target)
-        blacklist = blacklist or []
-        adaylar = []
-        for cand in live_targets:
-            cx, cy = self._target_center_xy(cand)
-            if exclude_center_radius and np.hypot(cx - ecx, cy - ecy) <= exclude_center_radius:
-                continue
-            if any(np.hypot(cx - bx, cy - by) < 35 for bx, by in blacklist):
-                continue
-            dist = float(np.hypot(cx - old_cx, cy - old_cy))
-            if dist <= 110:
-                adaylar.append((dist, cand))
-        if not adaylar:
-            return None
-        adaylar.sort(key=lambda item: item[0])
-        return adaylar[0][1]
-
-    def _valid_hedef_kuyruk_target(self, target):
-        if not isinstance(target, dict) or not target.get("box"):
-            return False
-        try:
-            b1, b2, b3, b4 = target["box"]
-            w_box = int(b3) - int(b1)
-            h_box = int(b4) - int(b2)
-            area = w_box * h_box
-            ar = w_box / h_box if h_box > 0 else 999
-            conf = float(target.get("conf", 0.0) or 0.0)
-            return 200 < area < 25000 and 0.3 < ar < 2.5 and conf >= 0.45
-        except Exception:
-            return False
-
-    def _select_hedef_kuyruk_targets(self, gecerli, ecx, ecy, count, exclude_center_radius=0, blacklist=None):
-        if not gecerli or count <= 0:
-            return []
-        blacklist = blacklist or []
-        aday_havuzu = [m for m in gecerli if self._valid_hedef_kuyruk_target(m)]
-        sirali = sorted(aday_havuzu, key=lambda m: np.hypot(self._target_center_xy(m)[0] - ecx, self._target_center_xy(m)[1] - ecy))
-        secilen = []
-        for m in sirali:
-            cx, cy = self._target_center_xy(m)
-            x, y = self._target_xy(m)
-            if exclude_center_radius and np.hypot(cx - ecx, cy - ecy) <= exclude_center_radius:
-                continue
-            if any(np.hypot(cx - bx, cy - by) < 35 for bx, by in blacklist):
-                continue
-            if any(np.hypot(cx - self._target_center_xy(s)[0], cy - self._target_center_xy(s)[1]) < 30 for s in secilen):
-                continue
-            secilen.append(m)
-            if len(secilen) >= count:
-                break
-        return secilen
-
-    def _fresh_hedef_kuyruk_targets(self, w, hwnd, cc):
-        if not hwnd or self._input_blocked(w):
-            return None
-        model_path = (cc or {}).get("model_yolu") or self.cfg.g("model_yolu")
-        if not model_path or not os.path.exists(model_path):
-            return None
-        try:
-            model = self._queue_model_cache.get(model_path)
-            if model is None:
-                model = YOLO(model_path)
-                dummy_size = 640
-                model(np.zeros((dummy_size, dummy_size, 3), dtype=np.uint8), verbose=False)
-                self._queue_model_cache[model_path] = model
-            r = win32gui.GetWindowRect(hwnd)
-            if r[0] < -32000:
-                return None
-            mon = {"top": r[1], "left": r[0], "width": r[2] - r[0], "height": r[3] - r[1]}
-            if mon["width"] <= 0 or mon["height"] <= 0:
-                return None
-            with mss.mss() as sct:
-                img = cv2.cvtColor(np.array(sct.grab(mon), dtype=np.uint8), cv2.COLOR_BGRA2BGR)
-            conf = FIXED_CONF_ESIK
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-            res = model(img, stream=True, verbose=False, conf=conf, half=(dev == "cuda"), imgsz=640, iou=0.45)
-            hedefler = []
-            frame_ts = time.time()
-            for rr in res:
-                if not rr.boxes:
-                    continue
-                bxs = rr.boxes.xyxy.cpu().numpy().astype(int)
-                cfs = rr.boxes.conf.cpu().numpy()
-                for i, (b1, b2, b3, b4) in enumerate(bxs):
-                    w_box = int(b3) - int(b1)
-                    h_box = int(b4) - int(b2)
-                    area = w_box * h_box
-                    ar = w_box / h_box if h_box > 0 else 999
-                    if not (200 < area < 25000 and 0.3 < ar < 2.5):
-                        continue
-                    hedefler.append({
-                        "x": int((b1 + b3) / 2),
-                        "y": int(b2 + (h_box * 0.56)),
-                        "cx": int((b1 + b3) / 2),
-                        "cy": int((b2 + b4) / 2),
-                        "box": (int(b1), int(b2), int(b3), int(b4)),
-                        "conf": float(cfs[i]),
-                    })
-            stable_hedefler = self._filter_stable_queue_targets((w, "fresh"), hedefler, frame_ts)
-            return {
-                "targets": stable_hedefler,
-                "ecx": mon["width"] // 2,
-                "ecy": mon["height"] // 2,
-                "ox": r[0],
-                "oy": r[1],
-                "ts": frame_ts,
-            }
-        except Exception as e:
-            last = self._hedef_kuyruk_fresh_log_t.get((w, "fresh_infer"), 0)
-            now = time.time()
-            if now - last > 3.0:
-                self._hedef_kuyruk_fresh_log_t[(w, "fresh_infer")] = now
-                log_event(self.st, "warn", f"[KUYRUK] anlik hedef yenileme basarisiz: {e} ({w})")
-            return None
-
-    def _hedef_kuyruk_frame_fresh(self, w, data_ts, now=None, max_age=1.50):
-        now = now or time.time()
-        if not data_ts:
-            return False
-        fresh = (now - float(data_ts)) <= max_age
-        if not fresh:
-            last = self._hedef_kuyruk_fresh_log_t.get(w, 0)
-            if now - last > 1.5:
-                self._hedef_kuyruk_fresh_log_t[w] = now
-                log_event(self.st, "info", f"[KUYRUK] goruntu gecikti, tiklama yok: {now - float(data_ts):.2f}s ({w})")
-        return fresh
 
     def _default_frame_fresh(self, w, data_ts, now=None):
         now = now or time.time()
@@ -1179,174 +1974,60 @@ class ActionThread(threading.Thread):
                 log_event(self.st, "warn", f"[HEDEF] goruntu gecikti, tiklama atlandi: {age:.2f}s ({w})")
         return fresh
 
-    def _ensure_hedef_kuyruk_state(self, w, hp_var=False, client_idx=None):
-        qkey = self._queue_state_key(w, client_idx)
-        q = self._hedef_kuyruk.get(qkey)
-        if not q or "hp_visible_lock" not in q:
-            q = {
-                "client_idx": client_idx,
-                "hp_was_visible": False,
-                "initial_clicked": False,
-                "batch_blacklist": [],
-                "last_initial_click_t": 0.0,
-                "no_target_since": 0.0,
-                "no_hp_since": 0.0,
-                "hp_visible_lock": False,
-                "pending_click_at": 0.0,
-                "pending_blacklist": [],
-                "last_hp_click_t": 0.0,
-            }
-            self._hedef_kuyruk[qkey] = q
-        return q
-
-    def _log_click_result(self, w, click_mode):
+    def _log_click_result(self, w, click_mode, x=None, y=None, client_idx=None):
         if click_mode == "sendinput_fallback":
             log_event(self.st, "warn", f"Tiklama fallback: Interception uygulanmadi, SendInput denendi ({w})")
         elif click_mode == "blocked":
             log_event(self.st, "warn", f"Tiklama atlandi: input kilitli ({w})")
-
-    def _click_hedef_kuyruk_target(self, w, target, hwnd, ox, oy, now, data_ts=0, min_gap=HEDEF_KUYRUK_BATCH_CLICK_GAP, client_idx=None):
-        if not target or self._input_blocked(w):
-            return False
-        if not self._hedef_kuyruk_frame_fresh(w, data_ts, now, max_age=HEDEF_KUYRUK_FRAME_MAX_AGE):
-            return False
-        qkey = self._queue_state_key(w, client_idx)
-        if now - self._hedef_kuyruk_click_t.get(qkey, 0) < min_gap:
-            return False
-        pencere_odakla(hwnd)
-        if self._input_blocked(w):
-            return False
-        x, y = self._queue_target_xy(target)
-        self._log_click_result(w, _tiklama_yap(self.cfg, x + ox, y + oy, hwnd))
-        click_now = time.time()
-        self._hedef_kuyruk_click_t[qkey] = click_now
-        self._son_tiklama_t[w] = click_now
-        self._son_hareket_t[w] = click_now
-        self._son_tiklama_zamani[w] = click_now
-        self._takilma_baslat_t[w] = click_now
-        self._son_hedef[w] = (float(x), float(y))
-        return True
-
-    def _click_hedef_kuyruk_batch(self, w, targets, hwnd, ox, oy, now, data_ts=0):
-        if not targets or self._input_blocked(w):
-            return 0
-        if not self._hedef_kuyruk_frame_fresh(w, data_ts, now, max_age=HEDEF_KUYRUK_FRAME_MAX_AGE):
-            return 0
-        pencere_odakla(hwnd)
-        if self._input_blocked(w):
-            return 0
-        clicked = 0
-        for target in targets:
-            if self._input_blocked(w):
-                break
-            if not self._valid_hedef_kuyruk_target(target):
-                continue
-            x, y = self._queue_target_xy(target)
-            self._log_click_result(w, _tiklama_yap(self.cfg, x + ox, y + oy, hwnd))
-            clicked += 1
-            click_now = time.time()
-            self._hedef_kuyruk_click_t[w] = click_now
-            self._son_tiklama_t[w] = click_now
-            self._son_hareket_t[w] = click_now
-            self._son_tiklama_zamani[w] = click_now
-            self._takilma_baslat_t[w] = click_now
-            self._son_hedef[w] = (float(x), float(y))
-        return clicked
-
-    def _handle_hedef_kuyruk(self, w, hp_var, cc, hwnd, now, mrk, gecerli, hedefler, ecx, ecy, ox, oy, active_windows=None, data_ts=0, client_idx=None):
-        if not self._hedef_kuyruk_aktif():
-            self._clear_hedef_kuyruk(w, client_idx)
-            self.dur[w] = "ARANIYOR"
-            return
-
-        q = self._ensure_hedef_kuyruk_state(w, hp_var, client_idx)
-        center_radius = self._hedef_kuyruk_merkez_yaricap(cc)
-
-        if not hp_var:
-            if q.get("hp_was_visible"):
-                log_event(self.st, "info", f"Mob oldu: {w}")
-                self._record_kill(w, q.get("client_idx") or client_idx)
-                if cc.get("oto_loot", True):
-                    self._loot_burst_async(w, hwnd, cc, "mob oldu")
-            q["hp_was_visible"] = False
-            q["hp_visible_lock"] = False
-            q["pending_click_at"] = 0.0
-            q["pending_blacklist"] = []
-            if not q.get("no_hp_since"):
-                q["no_hp_since"] = now
-            if q.get("initial_clicked") and now - float(q.get("no_hp_since", now) or now) >= HEDEF_KUYRUK_NO_HP_RESET_SN:
-                q["initial_clicked"] = False
-                q["batch_blacklist"] = []
-            if not q.get("initial_clicked"):
-                fresh = self._fresh_hedef_kuyruk_targets(w, hwnd, cc)
-                if not fresh:
-                    if not q.get("no_target_since"):
-                        q["no_target_since"] = now
-                    elif (
-                        bool(self.cfg.g("anti_sucuk"))
-                        and self._anti_sucuk_state_allowed("KUYRUK", hp_var)
-                        and now - float(q.get("no_target_since", now) or now) >= FIXED_ANTI_HAREKETSIZ_SN
-                    ):
-                        if self._anti_sucuk_araniyor_manevra(w, hwnd, now):
-                            q["no_target_since"] = time.time()
-                    self.dur[w] = "KUYRUK"
-                    return
-                q["no_target_since"] = 0.0
-                ilk = self._select_hedef_kuyruk_targets(
-                    fresh["targets"], fresh["ecx"], fresh["ecy"], 1, blacklist=q.get("batch_blacklist") or []
-                )
-                if ilk and self._click_hedef_kuyruk_target(
-                    w, ilk[0], hwnd, fresh["ox"], fresh["oy"], now, data_ts=fresh["ts"], min_gap=HEDEF_KUYRUK_BATCH_CLICK_GAP, client_idx=client_idx
-                ):
-                    q["initial_clicked"] = True
-                    q["last_initial_click_t"] = time.time()
-                    q["batch_blacklist"] = [self._target_center_xy(ilk[0])]
-                    q["no_hp_since"] = now
-            self.dur[w] = "KUYRUK"
-            return
-
-        q["hp_was_visible"] = True
-        q["no_hp_since"] = 0.0
-        if not q.get("hp_visible_lock"):
-            q["hp_visible_lock"] = True
-            q["pending_click_at"] = now + HEDEF_KUYRUK_HP_CLICK_DELAY
-            q["pending_blacklist"] = []
-
-        pending_at = float(q.get("pending_click_at", 0.0) or 0.0)
-        if pending_at <= 0 or now < pending_at:
-            self.dur[w] = "KUYRUK"
-            return
-
-        fresh = self._fresh_hedef_kuyruk_targets(w, hwnd, cc)
-        if not fresh:
-            self.dur[w] = "KUYRUK"
-            return
-        adaylar = self._select_hedef_kuyruk_targets(
-            fresh["targets"], fresh["ecx"], fresh["ecy"], 1, exclude_center_radius=center_radius,
-            blacklist=(q.get("batch_blacklist") or []) + (q.get("pending_blacklist") or [])
-        )
-        if not adaylar:
-            self.dur[w] = "KUYRUK"
-            return
-
-        if self._click_hedef_kuyruk_target(
-            w, adaylar[0], hwnd, fresh["ox"], fresh["oy"], now, data_ts=fresh["ts"], min_gap=HEDEF_KUYRUK_BATCH_CLICK_GAP, client_idx=client_idx
-        ):
-            q["last_hp_click_t"] = time.time()
-            q["pending_click_at"] = 0.0
-            q["pending_blacklist"] = [self._target_center_xy(adaylar[0])]
-            q["batch_blacklist"] = [self._target_center_xy(adaylar[0])]
-        self.dur[w] = "KUYRUK"
+        elif click_mode == "focus_failed":
+            log_event(self.st, "warn", f"Tiklama atlandi: hedef pencere odaklanamadi ({w})")
+        if click_mode not in ("blocked", "focus_failed"):
+            label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+            coordinate = "--" if x is None or y is None else f"({int(x)},{int(y)})"
+            log_event(
+                self.st,
+                "debug",
+                f"[CLICK-{label}] hedef={coordinate} yontem={click_mode or 'bilinmiyor'} ({w})",
+            )
 
     def _loot_tap(self):
+        """Z basisini gonder ve Windows/driver teslim sonucunu raporla."""
         if _ikdev is not None and INTERCEPTION_OK and not _force_sendinput:
-            _ik_tap(_SC['z'], delay=0.025)
-        else:
-            keyboard.press('z')
-            time.sleep(0.025)
-            keyboard.release('z')
+            down_ok = _ik_send(_SC['z'], _IKDOWN)
+            time.sleep(LOOT_KEY_HOLD_SECONDS)
+            up_ok = _ik_send(_SC['z'], _IKUP)
+            return {
+                "ok": bool(down_ok and up_ok),
+                "delivered": bool(down_ok and up_ok),
+                "method": "interception",
+            }
 
-    def _loot_burst(self, w, hwnd, cc, reason="loot", taps=None, delay=None, set_status=True):
+        if _send_keyboard_scancode_tap(_SC['z'], delay=LOOT_KEY_HOLD_SECONDS):
+            return {"ok": True, "delivered": True, "method": "sendinput_scancode"}
+
+        # Son geri donus: kutuphane olayi. API basari sayisi vermedigi icin
+        # bunu yalniz "denendi" olarak raporlariz, teslim edildi saymayiz.
+        try:
+            keyboard.press('z')
+            time.sleep(LOOT_KEY_HOLD_SECONDS)
+            keyboard.release('z')
+            return {"ok": True, "delivered": False, "method": "keyboard_fallback"}
+        except Exception as exc:
+            try:
+                keyboard.release('z')
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "delivered": False,
+                "method": "failed",
+                "error": str(exc),
+            }
+
+    def _loot_burst(
+        self, w, hwnd, cc, reason="loot", taps=None, delay=None,
+        interval=None, set_status=True,
+    ):
         if not cc.get("oto_loot", True) or self._input_blocked(w):
             return False
         now = time.time()
@@ -1361,10 +2042,13 @@ class ActionThread(threading.Thread):
         tap_count = max(1, min(tap_count, 12))
 
         try:
-            interval = float(cc.get("loot_interval", LOOT_TAP_INTERVAL) or LOOT_TAP_INTERVAL)
+            tap_interval = float(
+                interval if interval is not None
+                else (cc.get("loot_interval", LOOT_TAP_INTERVAL) or LOOT_TAP_INTERVAL)
+            )
         except Exception:
-            interval = LOOT_TAP_INTERVAL
-        interval = max(0.03, min(interval, 0.25))
+            tap_interval = LOOT_TAP_INTERVAL
+        tap_interval = max(0.03, min(tap_interval, 0.25))
 
         try:
             start_delay = float(delay if delay is not None else cc.get("loot_delay", LOOT_POST_KILL_DELAY))
@@ -1372,29 +2056,70 @@ class ActionThread(threading.Thread):
             start_delay = LOOT_POST_KILL_DELAY
         start_delay = max(0.0, min(start_delay, 0.6))
 
-        if hwnd:
-            pencere_odakla(hwnd)
+        # Beklerken global input kilidini tutma. Ozellikle iki client'ta diger
+        # pencerenin goruntu/aksiyon zincirini gereksiz yere donduruyordu.
         if start_delay and self._stop_event.wait(start_delay):
             return False
 
-        if set_status:
-            with self.st.lk:
-                self.st.durum[w] = "LOOT"
-        for _ in range(tap_count):
+        started = time.time()
+        sent_count = 0
+        delivered_count = 0
+        refocus_count = 0
+        methods = {}
+        aborted = ""
+
+        with input_transaction_lock:
             if self._input_blocked(w):
                 return False
-            self._loot_tap()
-            if self._stop_event.wait(interval):
+            if hwnd and not pencere_odakla(hwnd):
+                log_event(self.st, "warn", f"[LOOT] hedef pencere odaklanamadi ({w})")
                 return False
 
-        self._loot_last_t[w] = time.time()
-        last_log = self._loot_log_t.get(w, 0)
-        if time.time() - last_log > 2.0:
-            log_event(self.st, "info", f"[LOOT] {reason}: Z x{tap_count} ({w})")
-            self._loot_log_t[w] = time.time()
-        return True
+            if set_status:
+                with self.st.lk:
+                    self.st.durum[w] = "LOOT"
+            for tap_index in range(1, tap_count + 1):
+                if self._input_blocked(w):
+                    aborted = "input_bloklu"
+                    break
+                if hwnd and win32gui.GetForegroundWindow() != hwnd:
+                    refocus_count += 1
+                    if not pencere_odakla(hwnd):
+                        aborted = f"odak_kaybi_tap_{tap_index}"
+                        break
+                result = self._loot_tap()
+                method = str(result.get("method", "unknown"))
+                methods[method] = methods.get(method, 0) + 1
+                if result.get("ok"):
+                    sent_count += 1
+                if result.get("delivered"):
+                    delivered_count += 1
+                if not result.get("ok"):
+                    aborted = f"gonderim_hatasi_tap_{tap_index}:{result.get('error', '')}"
+                    break
+                if tap_index < tap_count and self._stop_event.wait(tap_interval):
+                    aborted = "bot_durduruldu"
+                    break
 
-    def _loot_burst_async(self, w, hwnd, cc, reason="loot", taps=None, delay=None):
+        self._loot_last_t[w] = time.time()
+        elapsed = time.time() - started
+        foreground_ok = bool(not hwnd or win32gui.GetForegroundWindow() == hwnd)
+        method_text = "+".join(f"{name}:{count}" for name, count in sorted(methods.items())) or "yok"
+        level = "info" if sent_count == tap_count and not aborted else "warn"
+        log_event(
+            self.st,
+            level,
+            f"[LOOT] {reason}: Z deneme={sent_count}/{tap_count} "
+            f"OS_teslim={delivered_count}/{tap_count} yontem={method_text} "
+            f"odak_son={'evet' if foreground_ok else 'hayir'} yeniden_odak={refocus_count} "
+            f"sure={elapsed:.2f}sn iptal={aborted or 'yok'} ({w})",
+        )
+        self._loot_log_t[w] = time.time()
+        return bool(sent_count == tap_count and not aborted)
+
+    def _loot_burst_async(
+        self, w, hwnd, cc, reason="loot", taps=None, delay=None, interval=None,
+    ):
         if not cc.get("oto_loot", True) or self._input_blocked(w):
             return False
         if self._loot_running.get(w, False):
@@ -1405,7 +2130,10 @@ class ActionThread(threading.Thread):
 
         def _run():
             try:
-                self._loot_burst(w, hwnd, cc_copy, reason, taps=taps, delay=delay, set_status=False)
+                self._loot_burst(
+                    w, hwnd, cc_copy, reason,
+                    taps=taps, delay=delay, interval=interval, set_status=False,
+                )
             finally:
                 self._loot_running[w] = False
 
@@ -1416,22 +2144,50 @@ class ActionThread(threading.Thread):
         import numpy as np
         now = time.time()
 
-        if self._hedef_kuyruk_aktif():
-            self._handle_hedef_kuyruk(w, hp_var, cc, hwnd, now, gecerli, gecerli, hedefler or [], ecx, ecy, ox, oy, data_ts=data_ts, client_idx=client_idx)
-            return
-        self._clear_hedef_kuyruk(w, client_idx)
-
-        if hp_var:
-            self.dur[w] = "SAVASIYOR"
-            # Timer sadece ilk kez (0 ise) set edilir â€” salÄ±nÄ±mda reset'lenmez
-            if not self._son_tiklama_zamani.get(w):
-                self._son_tiklama_zamani[w] = time.time()
+        hp_authoritative = is_hp_panel_authoritative(
+            hp_var,
+            now,
+            self._hp_ignore_until.get(w, 0),
+        )
+        if hp_authoritative:
+            # Acik panel yalnizca bir hedefin secili oldugunu kanitlar. Kirmizi
+            # dolgu yeni karelerde gercekten azalmadan SAVASIYOR durumuna gecme.
+            self.dur[w] = "DOGRULAMA"
+            self.dogr_t[w] = now
+            self.dogr_n[w] = 0
+            self._clear_combat_progress(w)
+            self._clear_approach(w)
+            self._begin_approach(w, now)
+            self._hp_onceki_durum.pop(w, None)
+            self._hp_kayip_t.pop(w, None)
             self._araniyor_baslat_t.pop(w, None)
+            label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+            log_event(
+                self.st,
+                "debug",
+                f"[HP-{label}] ust hedef paneli goruldu; kirmizi can azalmasi bekleniyor ({w})",
+            )
             return
+
+        gecerli = self._filter_target_failures(w, gecerli, now)
+        blocked = self._approach_blocked_target.get(w)
+        if blocked:
+            if now >= float(blocked.get("until", 0) or 0):
+                self._approach_blocked_target.pop(w, None)
+            else:
+                bx, by = blocked.get("pos", (0.0, 0.0))
+                alternatives = filter_targets_away_from(gecerli, (bx, by), 60.0)
+                if alternatives:
+                    gecerli = alternatives
+                elif gecerli:
+                    # Algilayici ayni hedefi gormeye devam etse bile o hedef
+                    # su anda kullanilabilir degil. Bunu "Metin yok" gibi
+                    # isleyerek Hareketli Metin Arama sayacini calistir.
+                    gecerli = []
 
         if not gecerli:
             anti_sucuk = bool(self.cfg.g("anti_sucuk"))
-            if anti_sucuk and self._anti_sucuk_state_allowed("ARANIYOR", hp_var):
+            if anti_sucuk and self._anti_sucuk_state_allowed("ARANIYOR", hp_authoritative):
                 baslangic = float(self._araniyor_baslat_t.get(w, 0) or 0)
                 if not baslangic:
                     self._araniyor_baslat_t[w] = now
@@ -1446,116 +2202,500 @@ class ActionThread(threading.Thread):
             return
 
         self._araniyor_baslat_t.pop(w, None)
-        h = gecerli[np.argmin([np.hypot(m[0]-ecx, m[1]-ecy) for m in gecerli])]
+        # Gecerli merkezleri ayrintili YOLO hedefleriyle eslestir. Boylece
+        # yalnizca ekran uzakligi degil; gorunen boyut, guven ve iki kare
+        # arasindaki kararlilik da hedef secimine katilir.
+        detailed_candidates = []
+        for target in hedefler or []:
+            tcx, tcy = self._target_center_xy(target)
+            if any(np.hypot(tcx - gx, tcy - gy) <= 3.0 for gx, gy in gecerli):
+                detailed_candidates.append(target)
+
+        ranked_targets = rank_target_candidates(detailed_candidates, (ecx, ecy))
+        if ranked_targets:
+            selected = ranked_targets[0]
+            h = self._target_center_xy(selected["target"])
+            log_event(
+                self.st,
+                "debug",
+                "[HEDEF] karma secim: "
+                f"aday={len(ranked_targets)} puan={selected['score']:.3f} "
+                f"merkez={selected['distance_score']:.2f} "
+                f"boyut={selected['size_score']:.2f} "
+                f"guven={selected['confidence_score']:.2f} "
+                f"kararlilik={selected['stability_score']:.2f} ({w})",
+            )
+        else:
+            # Kisa YOLO kacirmalarinda bellekte kalan merkezlerde kutu/guven
+            # bilgisi yoktur; bu durumda eski yakinlik davranisi guvenli geri donustur.
+            h = gecerli[np.argmin([np.hypot(m[0]-ecx, m[1]-ecy) for m in gecerli])]
         self._kilitli_hedef = getattr(self, '_kilitli_hedef', {})
         self._kilitli_hedef[w] = (float(h[0]), float(h[1]))
 
-        pencere_odakla(hwnd)
-        self._log_click_result(w, _tiklama_yap(self.cfg, h[0]+ox, h[1]+oy, hwnd))
+        click_x = int(round(h[0] + ox))
+        click_y = int(round(h[1] + oy))
+        with input_transaction_lock:
+            if self._input_blocked(w):
+                return
+            click_mode = _tiklama_yap(self.cfg, click_x, click_y, hwnd)
+        self._log_click_result(
+            w,
+            click_mode,
+            x=click_x,
+            y=click_y,
+            client_idx=client_idx,
+        )
+        if click_mode in ("blocked", "focus_failed"):
+            return
+        click_at = time.time()
+        self._start_target_generation(w, client_idx=client_idx, now=click_at)
         if cc.get("oto_loot", True):
             self._loot_burst(w, hwnd, cc, "hedef sonrasi", taps=1, delay=0.0, set_status=False)
-        self._son_tiklama_t[w] = now
-        self._son_hareket_t[w] = now  # hareketsiz timer sÄ±fÄ±rla
+        self._son_tiklama_t[w] = click_at
+        self._hp_ignore_until.pop(w, None)
+        self._clear_combat_progress(w)
         self.dur[w] = "DOGRULAMA"
         self.dogr_t[w] = time.time()
         self.dogr_n[w] = 0
+        self._begin_approach(w, self.dogr_t[w])
         self._son_tiklama_zamani[w] = time.time()
-        self._takilma_baslat_t[w] = time.time()
-        self._son_hedef[w] = (float(h[0]), float(h[1]))
-    def _handle_dogrulama(self, w, hp_var, cc):
+    def _handle_dogrulama(
+        self, w, hp_var, hp_fill, hp_fill_ready, scene_moving,
+        scene_motion_ready, cc, hwnd, target_generation=0, sample_ts=0,
+        client_idx=None, hp_sample_valid=True,
+    ):
         now = time.time()
-        bekleme_suresi = FIXED_DOGRULAMA_SN
-        
-        if now - self.dogr_t[w] > bekleme_suresi:
-            # Timeout doldu
-            if hp_var:
-                # HP bar var â†’ SAVASIYOR
-                self.dur[w] = "SAVASIYOR"
-                self.dogr_n[w] = 0
+        if not self._target_sample_is_new(w, target_generation, sample_ts):
+            expected = int(self._target_generation.get(w, 0) or 0)
+            if int(target_generation or 0) != expected:
+                label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                self._approach_log_throttled(
+                    w,
+                    "old_generation",
+                    f"[HP-{label}] eski kare atlandi: kare=G{int(target_generation or 0)} "
+                    f"hedef=G{expected} ({w})",
+                    now,
+                    2.0,
+                )
+            return
+        approach = self._approach.get(w)
+        if approach is None:
+            self._begin_approach(w, self.dogr_t.get(w, now) or now)
+            approach = self._approach[w]
+
+        elapsed = now - float(approach.get("started", now) or now)
+
+        # Can panelinin acilmasi yalnizca hedefin secildigini gosterir. Gercek
+        # savas icin secilen kirmizi dolgunun kalici olarak azalmasini bekle.
+        if hp_var and hp_fill_ready and hp_sample_valid and hp_fill is not None:
+            fill = float(hp_fill)
+            max_fill = approach.get("max_fill")
+            if max_fill is None:
+                approach["max_fill"] = fill
+                self._approach_log_throttled(w, "hp_baseline", f"Yaklasma: can referansi alindi %{fill * 100:.1f} ({w})", now, 10.0)
             else:
-                # HP bar yok â†’ ARANIYOR (yeni hedef ara)
-                self.dogr_n[w] = self.dogr_n.get(w,0)+1
-                if self.dogr_n[w] >= 3:
-                    self.dogr_n[w]=0
-                self._clear_target_click_cooldown(w, cc, now)
-                self.dur[w] = "ARANIYOR"
-        else:
-            # Timeout dolmadÄ±, bekle
-            pass
-
-    def _handle_savasiyor(self, w, hp_var, cc, hwnd, now, gecerli, ecx, ecy, ox, oy, client_idx=None):
-        import numpy as np
-        anti_sucuk = bool(self.cfg.g("anti_sucuk"))
-        stuck_sn = FIXED_ANTI_STUCK_SN
-
-        # TAKILMA: durum SAVASIYOR'da ne kadar kaldÄ±ÄŸÄ±nÄ± Ã¶lÃ§ â€” hp_var'dan baÄŸÄ±msÄ±z
-        if not self._takilma_baslat_t.get(w):
-            self._takilma_baslat_t[w] = now
-
-        if anti_sucuk and stuck_sn > 0:
-            takilma_t = self._takilma_baslat_t[w]
-            if now - takilma_t > stuck_sn:
-                if not self._anti_sucuk_cooldown_ready(w, now, "savas_uzarsa"):
-                    self._anti_sucuk_log_throttled(w, "savas_uzarsa_cooldown", f"Anti-sucuk SAVAS atlandi: cooldown ({w})", now)
-                    return
-                log_event(self.st, "warn", f"Takilma ({now - takilma_t:.1f}s/{stuck_sn}s): {w}")
-                kilitli = getattr(self, '_kilitli_hedef', {}).get(w)
-                bl = self._hedef_blacklist.setdefault(w, [])
-                if kilitli and not any(np.hypot(kilitli[0]-b[0], kilitli[1]-b[1]) < 30 for b in bl):
-                    bl.append((int(kilitli[0]), int(kilitli[1])))
-                if gecerli:
-                    filtreli = [m for m in gecerli if not any(np.hypot(m[0]-b[0], m[1]-b[1]) < 30 for b in bl)]
-                    if not filtreli:
-                        bl.clear()
-                        filtreli = gecerli
-                    h = filtreli[np.argmin([np.hypot(m[0]-ecx, m[1]-ecy) for m in filtreli])]
-                    pencere_odakla(hwnd)
-                    self._log_click_result(w, _tiklama_yap(self.cfg, h[0]+ox, h[1]+oy, hwnd))
-                    self._mark_anti_sucuk_manevra(w, now, "savas_uzarsa")
-                    self._takilma_baslat_t[w] = now
-                    self._son_hareket_t[w] = now      # hareketsiz timer sÄ±fÄ±rla
-                    self._son_tiklama_t[w] = now      # ARANIYOR'a geÃ§ilirse anÄ±nda tekrar tÄ±klamasÄ±n
-                    self._hp_onceki_durum.pop(w, None)  # yeni hedef â€” eski HP durumu geÃ§ersiz
-                    self._hp_kayip_t.pop(w, None)       # HP kayÄ±p zamanlayÄ±cÄ±sÄ±nÄ± sÄ±fÄ±rla
-                    log_event(self.st, "info", f"Yeni hedef tiklandi (takilma): {w}")
+                max_fill = max(float(max_fill), fill)
+                approach["max_fill"] = max_fill
+                drop = max_fill - fill
+                if drop >= APPROACH_HP_DROP_MIN:
+                    if not approach.get("drop_since"):
+                        approach["drop_since"] = now
+                    elif now - float(approach["drop_since"]) >= APPROACH_HP_DROP_CONFIRM_SN:
+                        self.dur[w] = "SAVASIYOR"
+                        self.dogr_n[w] = 0
+                        self._hp_onceki_durum[w] = True
+                        self._begin_combat_progress(w, fill, now, damage_confirmed=True)
+                        self._clear_approach(w)
+                        label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                        log_event(
+                            self.st,
+                            "info",
+                            f"Hasar basladi: {label} G{int(target_generation or 0)} "
+                            f"referans=%{max_fill * 100:.1f} simdi=%{fill * 100:.1f} "
+                            f"azalma=%{drop * 100:.1f}; SAVASIYOR ({w})",
+                        )
+                        return
                 else:
-                    self._takilma_baslat_t.pop(w, None)
-                    self.dur[w] = "ARANIYOR"
-                    log_event(self.st, "warn", f"Takilma: baska hedef yok, ARANIYOR'a geciliyor: {w}")
-                return
+                    approach["drop_since"] = 0.0
 
+        if scene_motion_ready:
+            if scene_moving:
+                approach["still_since"] = 0.0
+                self._approach_log_throttled(w, "moving", f"Yaklasma: sahne hareketli, hedefe gidiliyor ({w})", now, 3.0)
+            elif not approach.get("still_since"):
+                approach["still_since"] = now
+
+        # Eski kurulumlar can dolgu alanini secmeden de acilabilsin. Bu geri
+        # donus yolu eski davranisi korur; guvenilir savas onayi icin yeni alan gerekir.
+        if not hp_fill_ready:
+            if not approach.get("warned_no_fill"):
+                approach["warned_no_fill"] = True
+                log_event(self.st, "warn", f"Can cubugu secilmedi; eski HP panel dogrulamasi kullaniliyor ({w})")
+            if elapsed >= FIXED_DOGRULAMA_SN:
+                if hp_var:
+                    self.dur[w] = "SAVASIYOR"
+                    self.dogr_n[w] = 0
+                    self._clear_approach(w)
+                else:
+                    self._abandon_approach_target(w, cc, now, "HP paneli acilmadi")
+            return
+
+        # Panel hic acilmadiysa tiklama hedefe ulasmamis olabilir.
+        if not hp_var:
+            # Invalid/hidden HP must not skip the 8-second approach recovery.
+            missing_since = approach.setdefault("panel_missing_since", now)
+            retries = int(approach.get("recoveries", 0))
+            wait_for = APPROACH_INITIAL_STILL_SN if not retries else COMBAT_NO_PROGRESS_SN
+            if now - missing_since < wait_for or now < approach.get("check_after", 0):
+                return
+            if retries >= APPROACH_RECOVERY_MAX or elapsed >= APPROACH_MAX_SN:
+                self._abandon_approach_target(w, cc, now, "HP paneli tekrar kontrol ve 3 kurtarmada dogrulanamadi")
+                return
+            if self._run_approach_recovery(w, hwnd, retries + 1):
+                resumed = time.time()
+                approach["recoveries"] = retries + 1
+                approach["panel_missing_since"] = resumed
+                approach["check_after"] = resumed + COMBAT_NO_PROGRESS_SN
+            return
+        approach.pop("panel_missing_since", None)
+
+        if elapsed >= APPROACH_MAX_SN:
+            self._abandon_approach_target(w, cc, now, f"{APPROACH_MAX_SN:.0f}sn icinde hasar baslamadi")
+            return
+
+        still_since = float(approach.get("still_since", 0) or 0)
+        recoveries = int(approach.get("recoveries", 0) or 0)
+        check_after = float(approach.get("check_after", 0) or 0)
+        if recoveries:
+            # Manevradan sonra sahnenin hareketi basari sayilmaz. Yukaridaki
+            # HP dususu savasi dogrulamadiysa yeni ve gecerli olcumle ilerle.
+            # Ilk dususun ikinci kareyle dogrulanmasina da zaman tani.
+            stuck = (
+                hp_var and hp_sample_valid and hp_fill is not None
+                and now >= check_after and not approach.get("drop_since")
+            )
+        else:
+            stuck = (
+                hp_var
+                and scene_motion_ready
+                and not scene_moving
+                and still_since > 0
+                and now >= check_after
+                and now - still_since >= APPROACH_INITIAL_STILL_SN
+            )
+        if not stuck:
+            return
+
+        if recoveries >= APPROACH_RECOVERY_MAX:
+            self._abandon_approach_target(w, cc, now, "3 kurtarma (D2/A4/D6) sonrasinda hasar yok")
+            return
+
+        attempt = recoveries + 1
+        if self._run_approach_recovery(w, hwnd, attempt):
+            resumed = time.time()
+            approach["recoveries"] = attempt
+            approach["still_since"] = 0.0
+            approach["check_after"] = resumed + APPROACH_POST_RECOVERY_WAIT_SN
+            approach["drop_since"] = 0.0
+
+    def _consume_target_hp_evidence(self, w, generation, sample_ts, now):
+        progress = self._combat_progress.get(w)
+        if not progress or not progress.get("damage_confirmed"):
+            return
+        with self.st.lk:
+            evidence = dict(self.st.target_hp_evidence.get(w, {}))
+        ts = float(evidence.get("ts", 0))
+        if (evidence.get("generation") != generation or ts > sample_ts
+                or ts < float(progress.get("started", now))
+                or now - ts > COMBAT_PANEL_LOST_TIMEOUT_SN
+                or ts <= float(progress.get("evidence_consumed", 0))):
+            return
+        progress["evidence_consumed"] = ts
+        floor = progress.get("hp_floor")
+        value = evidence.get("fill")
+        if floor is not None and value is not None and 0 <= value < floor:
+            progress["hp_floor"] = value
+            progress["last_fill"] = value
+            log_event(self.st, "info", f"[HP-HAFIZA] G{generation} arada gorulen gecerli can alindi: %{floor*100:.1f} -> %{value*100:.1f} ({w})")
+
+    def _handle_savasiyor(
+        self, w, hp_var, hp_fill, hp_fill_ready, cc, hwnd, now,
+        client_idx=None, target_generation=0, sample_ts=0,
+        hp_sample_valid=True,
+    ):
+        if not self._target_sample_is_new(w, target_generation, sample_ts):
+            return
+        if not hp_var and hp_fill_ready:
+            self._consume_target_hp_evidence(w, target_generation, sample_ts, now)
         if hp_var:
             self._hp_onceki_durum[w] = True
             self._hp_kayip_t.pop(w, None)
             self._araniyor_baslat_t.pop(w, None)
-            self._hareketsiz_baslat_t.pop(w, None)
+            visible_progress = self._combat_progress.get(w)
+            if visible_progress is not None:
+                visible_progress["missing_samples"] = 0
+                visible_progress["missing_started"] = 0.0
+
+            if hp_fill_ready and hp_sample_valid and hp_fill is not None:
+                progress = self._combat_progress.get(w)
+                if progress is None:
+                    self._begin_combat_progress(w, hp_fill, now, damage_confirmed=False)
+                    progress = self._combat_progress[w]
+                else:
+                    progress["samples"] = int(progress.get("samples", 0) or 0) + 1
+
+                previous_floor = progress.get("hp_floor")
+                if not is_plausible_hp_sample(
+                    previous_floor,
+                    hp_fill,
+                    HP_MAX_UPWARD_JUMP,
+                ):
+                    # Vision bu kareyi normalde zaten reddeder. Bu ikinci
+                    # kontrol, eski/harici bir veri yolu imkansiz bir can
+                    # sicrama degeri gonderirse kurtarma veya hedef degisimi
+                    # uretilmesini de engeller.
+                    progress["check_after"] = now + COMBAT_POST_RECOVERY_WAIT_SN
+                    last_reject = float(progress.get("last_rejected_log", 0) or 0)
+                    if now - last_reject >= HP_DIAGNOSTIC_INTERVAL_SN:
+                        progress["last_rejected_log"] = now
+                        label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                        previous_text = (
+                            "--" if previous_floor is None
+                            else f"{float(previous_floor) * 100:.1f}"
+                        )
+                        log_event(
+                            self.st,
+                            "warn",
+                            f"[SAVAS-{label}] G{int(target_generation or 0)} imkansiz can "
+                            f"artisi yok sayildi: taban=%{previous_text} "
+                            f"simdi=%{float(hp_fill) * 100:.1f}; hedef korundu ({w})",
+                        )
+                    return
+                progress["last_fill"] = float(hp_fill)
+
+                hp_floor, advanced = track_hp_progress(
+                    progress.get("hp_floor"),
+                    hp_fill,
+                    COMBAT_HP_PROGRESS_MIN,
+                )
+                progress["hp_floor"] = hp_floor
+                if advanced:
+                    if not hasattr(self, "_last_damage_t"):
+                        self._last_damage_t = {}
+                    self._last_damage_t[w] = now
+                    progress["damage_confirmed"] = True
+                    progress["last_progress"] = now
+                    progress["check_after"] = now
+                    progress["progress_events"] = int(progress.get("progress_events", 0) or 0) + 1
+                    # Kurtarmalar yalnizca ardisik ilerlememe durumunu saysin.
+                    # Can tekrar azaldiginda hedef normal sekilde calisiyor.
+                    progress["recoveries"] = 0
+                    self._combat_log_throttled(w, client_idx, progress, hp_fill, now, force=True)
+                    return
+
+                self._combat_log_throttled(w, client_idx, progress, hp_fill, now)
+
+                last_progress = float(progress.get("last_progress", now) or now)
+                check_after = float(progress.get("check_after", now) or now)
+                if now < check_after or now - last_progress < COMBAT_NO_PROGRESS_SN:
+                    return
+
+                recoveries = int(progress.get("recoveries", 0) or 0)
+                if recoveries >= COMBAT_RECOVERY_MAX:
+                    fill_text = f"{float(hp_fill) * 100:.1f}"
+                    floor = progress.get("hp_floor")
+                    floor_text = "--" if floor is None else f"{float(floor) * 100:.1f}"
+                    no_progress = now - float(progress.get("last_progress", now) or now)
+                    self._abandon_combat_target(
+                        w,
+                        cc,
+                        now,
+                        f"can=%{fill_text}, taban=%{floor_text}, {no_progress:.1f}sn yeni dusus yok; "
+                        f"{COMBAT_RECOVERY_MAX} kurtarma sonrasinda azalmadi",
+                    )
+                    return
+
+                # Kisa sureli ilerlememede hedefi koru ve kurtarma uygula.
+                # Uc ardisik kurtarma da sonuc vermezse yukaridaki sinir,
+                # acik kalan HP panelinin client'i sonsuza kadar kilitlemesini
+                # engeller.
+                if self._run_combat_recovery(w, hwnd):
+                    recovered_at = time.time()
+                    progress["recoveries"] = recoveries + 1
+                    progress["last_progress"] = recovered_at
+                    progress["check_after"] = recovered_at + COMBAT_POST_RECOVERY_WAIT_SN
+                return
             return
 
         else:
             onceki_hp = self._hp_onceki_durum.get(w, None)
             hp_bekleme_sn = self._hp_bitis_gecikmesi(cc)
+            progress = self._combat_progress.get(w)
+            if progress is None:
+                # Can dolgu alani bulunmayan eski kalibrasyon yolu da
+                # SAVASIYOR durumuna girebilir. Kayip zamanini ve kurtarma
+                # sayisini mutlaka kalici client durumunda tut.
+                self._begin_combat_progress(
+                    w, None, now, damage_confirmed=False,
+                )
+                progress = self._combat_progress[w]
 
-            if onceki_hp is True and hp_bekleme_sn > 0:
+            if onceki_hp is True:
                 if w not in self._hp_kayip_t:
                     self._hp_kayip_t[w] = now
+                    progress["missing_started"] = now
+                    progress["missing_samples"] = 0
+
+                progress["missing_samples"] = int(progress.get("missing_samples", 0) or 0) + 1
+                missing_since = float(self._hp_kayip_t.get(w, now) or now)
+                missing_for = now - missing_since
+                floor = progress.get("hp_floor")
+                near_zero = floor is not None and float(floor) <= COMBAT_DEATH_LOW_HP_MAX
+                required_missing = hp_bekleme_sn
+                missing_samples = int(progress.get("missing_samples", 0) or 0)
+                if not near_zero:
+                    # Yuksek canda panel kaybi olum degildir. Ancak pencere
+                    # ortulmesi veya gercek bir takilma hedefi sonsuza kadar
+                    # SAVASIYOR durumunda tutmamali. Once hedef client'i odaga
+                    # getiren kademeli kurtarma dizisini sinirli sayida dene.
+                    total_missing_since = float(
+                        progress.get("missing_started", missing_since) or missing_since
+                    )
+                    total_missing_for = now - total_missing_since
+                    recoveries = int(progress.get("recoveries", 0) or 0)
+                    check_after = float(progress.get("check_after", 0) or 0)
+
+                    if (
+                        missing_samples >= COMBAT_DEATH_MIN_ABSENT_SAMPLES
+                        and (
+                            total_missing_for >= COMBAT_PANEL_LOST_TIMEOUT_SN
+                            or (
+                                recoveries >= COMBAT_RECOVERY_MAX
+                                and missing_for >= COMBAT_PANEL_LOST_RECOVERY_SN
+                            )
+                        )
+                    ):
+                        self._abandon_combat_target(
+                            w, cc, now,
+                            f"HP paneli toplam {total_missing_for:.1f}sn kayip; "
+                            f"{recoveries}/{COMBAT_RECOVERY_MAX} kurtarma sonucu panel donmedi; "
+                            "olum dogrulanmadi, kill/loot uygulanmadan aramaya donuluyor",
+                        )
+                        return
+
+                    if (
+                        missing_samples >= COMBAT_DEATH_MIN_ABSENT_SAMPLES
+                        and missing_for >= COMBAT_PANEL_LOST_RECOVERY_SN
+                        and now >= check_after
+                    ):
+                        if self._run_combat_recovery(w, hwnd):
+                            recovered_at = time.time()
+                            progress["recoveries"] = recoveries + 1
+                            progress["last_progress"] = recovered_at
+                            progress["check_after"] = (
+                                recovered_at + COMBAT_POST_RECOVERY_WAIT_SN
+                            )
+                            # Bir sonraki deneme icin kesintisiz kayip fazini
+                            # sifirla; toplam kayip zamani missing_started ile
+                            # korunur ve mutlak sure siniri calismaya devam eder.
+                            self._hp_kayip_t[w] = recovered_at
+                            progress["missing_samples"] = 0
+                            label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                            log_event(
+                                self.st,
+                                "info",
+                                f"[HP-{label}] kayip panel kurtarmasi "
+                                f"{recoveries + 1}/{COMBAT_RECOVERY_MAX} tamamlandi; "
+                                "panel yeniden kontrol ediliyor "
+                                f"({w})",
+                            )
+                        else:
+                            # Gecici CAPTCHA/global duraklama veya odak hatasi
+                            # ayni aksiyonun her karede tekrar denenmesine yol
+                            # acmasin.
+                            progress["check_after"] = now + COMBAT_POST_RECOVERY_WAIT_SN
+                        return
+
+                    label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                    last_uncertain = float(progress.get("last_uncertain_log", 0) or 0)
+                    if missing_samples == 1 or now - last_uncertain >= 5.0:
+                        progress["last_uncertain_log"] = now
+                        floor_text = "--" if floor is None else f"{float(floor) * 100:.1f}"
+                        log_event(
+                            self.st,
+                            "warn",
+                            f"[OLUM-{label}] karar bekletildi: son_can=%{floor_text} > "
+                            f"%{COMBAT_DEATH_LOW_HP_MAX * 100:.0f}, panel_yok={missing_for:.2f}sn "
+                            f"toplam_yok={total_missing_for:.2f}sn yok_kare={missing_samples} "
+                            f"kurtarma={recoveries}/{COMBAT_RECOVERY_MAX}; "
+                            f"hedef/loot degismedi ({w})",
+                        )
+                    return
+                if missing_samples == 1:
+                    label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                    floor_text = "--" if floor is None else f"{float(floor) * 100:.1f}"
+                    log_event(
+                        self.st,
+                        "debug",
+                        f"[SAVAS-{label}] HP paneli kayip; son_can=%{floor_text}, olum icin "
+                        f"{required_missing:.2f}sn ve {COMBAT_DEATH_MIN_ABSENT_SAMPLES} taze "
+                        f"yok-kare bekleniyor ({w})",
+                    )
+                if (
+                    missing_for < required_missing
+                    or missing_samples < COMBAT_DEATH_MIN_ABSENT_SAMPLES
+                ):
                     return
 
-                if now - self._hp_kayip_t[w] < hp_bekleme_sn:
-                    return
-
+            missing_since = float(self._hp_kayip_t.get(w, now) or now)
             self._hp_kayip_t.pop(w, None)
             self._hp_onceki_durum.pop(w, None)
 
-            if onceki_hp is True:
-                log_event(self.st, "info", f"Mob oldu: {w}")
+            damage_confirmed = bool(progress.get("damage_confirmed"))
+            if onceki_hp is True and damage_confirmed:
+                start_fill = progress.get("start_fill")
+                floor = progress.get("hp_floor")
+                missing_for = now - missing_since
+                missing_samples = int(progress.get("missing_samples", 0) or 0)
+                label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                start_text = "--" if start_fill is None else f"{float(start_fill) * 100:.1f}"
+                floor_text = "--" if floor is None else f"{float(floor) * 100:.1f}"
+                log_event(
+                    self.st,
+                    "info",
+                    f"Mob oldu: {w} [{label} G{int(self._target_generation.get(w, 0) or 0)} "
+                    f"baslangic=%{start_text} en_dusuk=%{floor_text} "
+                    f"panel_yok={missing_for:.2f}sn yok_kare={missing_samples} hasar=evet]",
+                )
                 self._clear_target_click_cooldown(w, cc, now)
                 self._son_tiklama_zamani[w] = now
-                self._takilma_baslat_t.pop(w, None)
                 self._record_kill(w, client_idx)
                 if cc.get("oto_loot", True):
-                    self._loot_burst_async(w, hwnd, cc, "mob oldu")
+                    self._loot_burst_async(
+                        w,
+                        hwnd,
+                        cc,
+                        "mob oldu",
+                        taps=LOOT_KILL_TAPS,
+                        delay=LOOT_KILL_DELAY,
+                        interval=LOOT_KILL_INTERVAL,
+                    )
+            elif onceki_hp is True:
+                label = f"C{client_idx}" if client_idx in CLIENT_IDS else "C?"
+                missing_for = now - missing_since
+                missing_samples = int(progress.get("missing_samples", 0) or 0)
+                log_event(
+                    self.st,
+                    "warn",
+                    f"[OLUM-{label}] ust hedef paneli {missing_for:.2f}sn kayip fakat "
+                    f"kirmizi can azalmasi dogrulanmadi (yok_kare={missing_samples}); "
+                    f"olum ve loot iptal ({w})",
+                )
+                self._son_tiklama_t[w] = now
             else:
                 self._son_tiklama_t[w] = now
+
+            self._clear_combat_progress(w)
 
             self.dur[w] = "ARANIYOR"
             with self.st.lk:
@@ -1572,105 +2712,61 @@ class ActionThread(threading.Thread):
     def _mark_anti_sucuk_manevra(self, w, when=None, kind="genel"):
         t = when or time.time()
         self._son_manevra_t[(w, kind)] = t
-        self._son_hareket_t[w] = t
-
-    def _anti_sucuk_manevra_sureleri(self, w, kind, now=None):
-        now = now or time.time()
-        son = float(self._son_manevra_t.get((w, kind), 0) or 0)
-        tekrar = son > 0 and now - son <= ANTI_SUCUK_REPEAT_WINDOW_SN
-        if tekrar:
-            return (
-                ANTI_SUCUK_BACK_HOLD_REPEAT_SN,
-                ANTI_SUCUK_SIDE_HOLD_REPEAT_MIN_SN,
-                ANTI_SUCUK_SIDE_HOLD_REPEAT_MAX_SN,
-            )
-        return (
-            ANTI_SUCUK_BACK_HOLD_SN,
-            ANTI_SUCUK_SIDE_HOLD_MIN_SN,
-            ANTI_SUCUK_SIDE_HOLD_MAX_SN,
-        )
 
     def _anti_sucuk_araniyor_manevra(self, w, hwnd, now):
         if not self._anti_sucuk_cooldown_ready(w, now, "hedef_yoksa"):
-            self._anti_sucuk_log_throttled(w, "hedef_yoksa_cooldown", f"Anti-sucuk ARANIYOR atlandi: cooldown ({w})", now)
+            self._anti_sucuk_log_throttled(w, "hedef_yoksa_cooldown", f"Hareketli Metin Arama bekliyor: cooldown ({w})", now)
             return False
         if self._s_basmis.get(w, False):
-            self._anti_sucuk_log_throttled(w, "hedef_yoksa_reentry", f"Anti-sucuk ARANIYOR atlandi: manevra devam ediyor ({w})", now)
+            self._anti_sucuk_log_throttled(w, "hedef_yoksa_reentry", f"Hareketli Metin Arama zaten calisiyor ({w})", now)
             return False
         if self._input_blocked(w):
-            self._anti_sucuk_log_throttled(w, "hedef_yoksa_input", f"Anti-sucuk ARANIYOR atlandi: input bloklu ({w})", now)
+            self._anti_sucuk_log_throttled(w, "hedef_yoksa_input", f"Hareketli Metin Arama atlandi: input bloklu ({w})", now)
             return False
         self._s_basmis[w] = True
-        tus = None
         try:
-            pencere_odakla(hwnd)
-            back_hold, side_min, side_max = self._anti_sucuk_manevra_sureleri(w, "hedef_yoksa", now)
-            keyboard.press('s')
-            log_event(self.st, "info", f"Anti-sucuk ARANIYOR: S basili ({w})")
-            if self._stop_event.wait(back_hold):
-                return False
-            keyboard.release('s')
-            tus = random.choice(['a', 'd'])
-            time.sleep(random.uniform(0.05, 0.20))
-            keyboard.press(tus)
-            time.sleep(random.uniform(side_min, side_max))
-            keyboard.release(tus)
+            for attempt, search_key in enumerate(METIN_SEARCH_KEYS, 1):
+                log_event(
+                    self.st,
+                    "info",
+                    f"Hareketli Metin Arama: {search_key.upper()} {METIN_SEARCH_Q_HOLD_SN:.0f}sn basili ({attempt}/{len(METIN_SEARCH_KEYS)}, {w})",
+                )
+                if not self._hold_recovery_key(w, search_key, METIN_SEARCH_Q_HOLD_SN, hwnd):
+                    return False
+                if self._stop_event.wait(METIN_SEARCH_Q_SETTLE_SN) or self._recovery_input_blocked(w):
+                    return False
+                with self.st.lk:
+                    latest = dict(self.st.wdata.get(w, {}))
+                latest_ts = float(latest.get("publish_ts", latest.get("ts", 0)) or 0)
+                ecx, ecy = latest.get("ekran_merkez", (0, 0))
+                ignore_radius = latest.get("client_cfg", {}).get("ignore_radius", 35)
+                centers = self._filter_target_failures(w, latest.get("merkezler", []), time.time())
+                blocked = self._approach_blocked_target.get(w)
+                if blocked:
+                    centers = filter_targets_away_from(
+                        centers,
+                        blocked.get("pos"),
+                        60.0,
+                    )
+                target_found = (
+                    latest_ts > 0
+                    and time.time() - latest_ts <= DEFAULT_TARGET_FRAME_MAX_AGE
+                    and any(np.hypot(x - ecx, y - ecy) > ignore_radius for x, y in centers)
+                )
+                if target_found:
+                    log_event(
+                        self.st,
+                        "info",
+                        f"Hareketli Metin Arama: {attempt}. adim {search_key.upper()} sonrasi Metin bulundu ({w})",
+                    )
+                    break
             t = time.time()
             self._araniyor_baslat_t[w] = t
             self._mark_anti_sucuk_manevra(w, t, "hedef_yoksa")
-            log_event(self.st, "info", f"Anti-sucuk ARANIYOR: S+{tus.upper()} yapildi ({w})")
+            log_event(self.st, "info", f"Hareketli Metin Arama tamamlandi ({w})")
             return True
         finally:
-            try:
-                keyboard.release('s')
-                if tus:
-                    keyboard.release(tus)
-            except Exception:
-                pass
             self._s_basmis[w] = False
-
-    def _anti_sucuk_hareketsiz_manevra(self, w, hwnd, now, state="", hp_var=False):
-        if not self._anti_sucuk_cooldown_ready(w, now, "hareket_takilirsa"):
-            self._anti_sucuk_log_throttled(w, "hareket_takilirsa_cooldown", f"Anti-sucuk HAREKETSIZ atlandi: cooldown ({w})", now)
-            return False
-        # Re-entry korumasÄ± (manevra zaten devam ediyorsa atla)
-        if self._hareketsiz_basmis.get(w, False):
-            self._anti_sucuk_log_throttled(w, "hareket_takilirsa_reentry", f"Anti-sucuk HAREKETSIZ atlandi: manevra devam ediyor ({w})", now)
-            return False
-        if self._input_blocked(w):
-            self._anti_sucuk_log_throttled(w, "hareket_takilirsa_input", f"Anti-sucuk HAREKETSIZ atlandi: input bloklu ({w})", now)
-            return False
-        self._hareketsiz_basmis[w] = True
-        tus = None
-        try:
-            pencere_odakla(hwnd)
-            back_hold, side_min, side_max = self._anti_sucuk_manevra_sureleri(w, "hareket_takilirsa", now)
-            keyboard.press('s')
-            ctx = ""
-            if hp_var and state == "SAVASIYOR":
-                ctx = " SAVAS/HP"
-            elif hp_var and state == "KUYRUK":
-                ctx = " KUYRUK/HP"
-            log_event(self.st, "info", f"Anti-sucuk HAREKETSIZ{ctx}: S basili ({w})")
-            time.sleep(back_hold)
-            keyboard.release('s')
-            tus = random.choice(['a', 'd'])
-            time.sleep(random.uniform(0.05, 0.20))
-            keyboard.press(tus)
-            time.sleep(random.uniform(side_min, side_max))
-            keyboard.release(tus)
-            t = time.time()
-            self._mark_anti_sucuk_manevra(w, t, "hareket_takilirsa")
-            log_event(self.st, "info", f"Anti-sucuk HAREKETSIZ{ctx}: S+{tus.upper()} yapildi ({w})")
-            return True
-        finally:
-            try:
-                keyboard.release('s')
-                if tus:
-                    keyboard.release(tus)
-            except Exception:
-                pass
-            self._hareketsiz_basmis[w] = False
 
     def run(self):
         while not self._stop_event.is_set():
@@ -1680,21 +2776,23 @@ class ActionThread(threading.Thread):
                 aktif = self.st.aktif
                 wd = dict(self.st.wdata)
                 captcha_cd = dict(self.st.captcha_cd)
-                captcha_global_active = self.st.captcha_global_active
-                captcha_global_owner = self.st.captcha_global_owner
-                message_global_active = self.st.message_global_active
-                message_global_owner = self.st.message_global_owner
 
             if not aktif:
                 self.dur.clear(); self.dogr_t.clear(); self.dogr_n.clear()
                 self._hp_onceki_durum.clear(); self._son_tiklama_t.clear()
                 self._hp_ignore_until.clear(); self._hp_kayip_t.clear()
-                self._hedef_kuyruk.clear()
+                self._approach.clear(); self._approach_blocked_target.clear()
+                self._stale_frame_diag_t.clear()
+                self._combat_progress.clear()
+                self._target_generation.clear(); self._last_target_sample.clear()
+                self._combat_diag_t.clear()
+                self._buff_next_t.clear(); self._buff_running.clear()
+                self._buff_needs_remount.clear(); self._buff_diag_t.clear()
                 continue
 
             ordered_wd = []
             seen_w = set()
-            for ci in (1, 2):
+            for ci in CLIENT_IDS:
                 cw = self.cfg.client(ci).get("pencere", "Yok")
                 if cw in wd and cw not in seen_w:
                     ordered_wd.append((cw, wd[cw]))
@@ -1703,19 +2801,32 @@ class ActionThread(threading.Thread):
                 if item[0] not in seen_w:
                     ordered_wd.append(item)
                     seen_w.add(item[0])
-            active_windows = [item[0] for item in ordered_wd]
-
             for w, data in ordered_wd:
+                # Onceki client uzun bir buff/kurtarma hareketi yaptiysa dongu
+                # basinda alinan snapshot eskimis olabilir. Her client kararindan
+                # hemen once VisionThread'in en son yayinini tekrar al.
+                with self.st.lk:
+                    latest_data = self.st.wdata.get(w)
+                if latest_data is None:
+                    continue
+                data = dict(latest_data)
                 data_ts = float(data.get("ts", 0) or 0)
                 publish_ts = float(data.get("publish_ts", data_ts) or 0)
-                data_age = time.time() - (publish_ts or data_ts) if (publish_ts or data_ts) else 999.0
-                if data_ts and time.time() - data_ts > 2.0:
-                    if w in self._hedef_kuyruk:
-                        self._clear_hedef_kuyruk(w)
-                        log_event(self.st, "warn", f"[KUYRUK] client goruntusu guncel degil, kuyruk temizlendi ({w})")
+                if data_ts and time.time() - data_ts > VISION_STALE_FRAME_SN:
+                    stale_age = time.time() - data_ts
+                    last_stale_log = float(self._stale_frame_diag_t.get(w, 0) or 0)
+                    if time.time() - last_stale_log >= VISION_STALE_LOG_EVERY_SN:
+                        self._stale_frame_diag_t[w] = time.time()
+                        with self.st.lk:
+                            self.st.durum[w] = "GORUNTU DONDU"
+                        log_event(
+                            self.st,
+                            "warn",
+                            f"[GORUNTU] yeni kare gelmiyor ({stale_age:.1f}sn); hareket uygulanmadi ({w})",
+                        )
                     continue
+                self._stale_frame_diag_t.pop(w, None)
                 if time.time() < captcha_cd.get(w, 0):
-                    self._clear_hedef_kuyruk(w)
                     with self.st.lk:
                         self.st.durum[w] = "CAPTCHA"
                         self.st.captcha_block[w] = True
@@ -1732,11 +2843,31 @@ class ActionThread(threading.Thread):
                 mrk = data.get("merkezler",[])
                 hedefler = data.get("hedefler", [])
                 hp_var = data.get("hp_var",False)
+                hp_fill = data.get("hp_fill")
+                hp_fill_ready = bool(data.get("hp_fill_ready", False))
+                hp_sample_valid = bool(data.get("hp_sample_valid", True))
+                scene_moving = bool(data.get("scene_moving", False))
+                scene_motion_ready = bool(data.get("scene_motion_ready", False))
+                target_generation = int(data.get("target_generation", 0) or 0)
                 ecx,ecy = data.get("ekran_merkez",(0,0))
                 ox,oy = data.get("offset",(0,0))
                 hwnd = data.get("hwnd")
                 cc = data.get("client_cfg",{})
                 client_idx = data.get("client_idx")
+                try:
+                    if self._handle_player_life(w, hwnd, client_idx):
+                        continue
+                except Exception as exc:
+                    self._anti_sucuk_log_throttled(w, "revive_error", f"Yeniden dogma kontrol hatasi; islem bekletildi: {exc}", now)
+                    continue
+                if not hasattr(self, "_last_damage_t"):
+                    self._last_damage_t, self._no_damage_warn_t = {}, {}
+                if not hasattr(self, "_no_damage_warn_t"):
+                    self._no_damage_warn_t = {}
+                last_damage = self._last_damage_t.setdefault(w, now)
+                if now - last_damage >= 120 and now - self._no_damage_warn_t.get(w, 0) >= 60:
+                    self._no_damage_warn_t[w] = now
+                    log_event(self.st, "warn", f"[ILERLEME-C{client_idx}] {now-last_damage:.0f}sn hasar dogrulanamadi; pencere/HP/hedef kontrolu gerekiyor ({w})")
                 ign = cc.get("ignore_radius",35)
 
                 gecerli = [m for m in mrk if np.hypot(m[0]-ecx,m[1]-ecy) > ign]
@@ -1746,64 +2877,44 @@ class ActionThread(threading.Thread):
 
                 state = self.dur[w]
 
-                # â”€â”€ GLOBAL HAREKETSÄ°Z KONTROLÃœ (koordinat bazlÄ±) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                # EkranÄ±n merkez bÃ¶lgesi X sn boyunca sabit kaldÄ±ysa S+AD yap.
-                # Durum, hp_var veya mob varlÄ±ÄŸÄ±ndan tamamen baÄŸÄ±msÄ±z Ã§alÄ±ÅŸÄ±r.
-                anti_sucuk_g = bool(self.cfg.g("anti_sucuk"))
-                hareketsiz_sn_g = FIXED_ANTI_HAREKETSIZ_SN
-                son_hareket_t = float(self._son_hareket_t.get(w, 0) or 0)
-                hareket_komutu_yakin = son_hareket_t > 0 and now - son_hareket_t >= 2.0
-                hareket_durum_uygun = self._anti_sucuk_state_allowed(state, hp_var)
-                hareket_kontrol_aktif = (
-                    anti_sucuk_g
-                    and hareketsiz_sn_g > 0
-                    and hareket_komutu_yakin
-                    and hareket_durum_uygun
-                )
-                if hareket_kontrol_aktif:
+                # Olumden sonraki Z serisi tamamlanmadan ayni client yeni bir
+                # hedefe tiklamasin. Diger client'lar dongude ilerlemeye devam eder.
+                if self._loot_running.get(w, False):
                     with self.st.lk:
-                        son_sahne = self.st.scene_changed_t.get(w, 0)
-                    if son_sahne == 0:
-                        # Ä°lk kez â€” sadece baÅŸlangÄ±Ã§ zamanÄ± kaydet, hareket etme
-                        with self.st.lk:
-                            self.st.scene_changed_t[w] = now
-                    elif now - son_sahne > hareketsiz_sn_g:
-                        if self._anti_sucuk_hareketsiz_manevra(w, hwnd, now, state, hp_var):
-                            # Manevra bitti â€” scene_changed_t'yi gÃ¼ncelle ki tekrar tetiklenmesin
-                            with self.st.lk:
-                                self.st.scene_changed_t[w] = time.time()
-                    else:
-                        self._anti_sucuk_log_throttled(w, "scene_moved", f"Anti-sucuk HAREKETSIZ bekliyor: sahne hareketli ({now - son_sahne:.1f}s/{hareketsiz_sn_g}s, {state}, hp={hp_var})", now, interval=5.0)
-                else:
-                    if anti_sucuk_g and hareket_komutu_yakin and not hareket_durum_uygun:
-                        self._anti_sucuk_log_throttled(w, "korumali_durum", f"Anti-sucuk HAREKETSIZ atlandi: durum uygun degil ({state}, hp={hp_var}, {w})", now, interval=5.0)
-                    with self.st.lk:
-                        self.st.scene_changed_t[w] = now
+                        self.st.durum[w] = "LOOT"
+                    continue
+
+                if now >= float(self._buff_next_t.get(w, 0) or 0):
+                    if self._run_buff_cycle(w, hwnd):
+                        self._buff_next_t[w] = time.time() + BUFF_INTERVAL_SECONDS
+                        continue
+
                 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
                 try:
-                    hedef_kuyruk_aktif = self._hedef_kuyruk_aktif()
-                    if not hedef_kuyruk_aktif and (state == "KUYRUK" or self._queue_state_key(w, client_idx) in self._hedef_kuyruk):
-                        self._clear_hedef_kuyruk(w, client_idx)
-                        self.dur[w] = "ARANIYOR"
-                        state = "ARANIYOR"
                     action_ts = publish_ts or data_ts
-                    if hedef_kuyruk_aktif and state in ("ARANIYOR", "KUYRUK") and data_age > HEDEF_KUYRUK_FRAME_MAX_AGE:
-                        self._hedef_kuyruk_frame_fresh(w, action_ts, now)
-                        continue
                     if state == "ARANIYOR":
-                        if not hedef_kuyruk_aktif:
-                            if not hp_var and not self._default_frame_fresh(w, action_ts, now):
-                                continue
-                            self._handle_araniyor(w, gecerli, hp_var, ecx, ecy, hwnd, cc, ox, oy, hedefler, action_ts, client_idx=client_idx)
-                        else:
-                            self._handle_hedef_kuyruk(w, hp_var, cc, hwnd, now, mrk, gecerli, hedefler, ecx, ecy, ox, oy, active_windows, action_ts, client_idx=client_idx)
-                    elif state == "KUYRUK":
-                        self._handle_hedef_kuyruk(w, hp_var, cc, hwnd, now, mrk, gecerli, hedefler, ecx, ecy, ox, oy, active_windows, action_ts, client_idx=client_idx)
+                        if not hp_var and not self._default_frame_fresh(w, action_ts, now):
+                            continue
+                        self._handle_araniyor(w, gecerli, hp_var, ecx, ecy, hwnd, cc, ox, oy, hedefler, action_ts, client_idx=client_idx)
                     elif state == "DOGRULAMA":
-                        self._handle_dogrulama(w, hp_var, cc)
+                        self._handle_dogrulama(
+                            w, hp_var, hp_fill, hp_fill_ready,
+                            scene_moving, scene_motion_ready, cc, hwnd,
+                            target_generation=target_generation,
+                            sample_ts=data_ts,
+                            client_idx=client_idx,
+                            hp_sample_valid=hp_sample_valid,
+                        )
                     elif state == "SAVASIYOR":
-                        self._handle_savasiyor(w, hp_var, cc, hwnd, now, gecerli, ecx, ecy, ox, oy, client_idx=client_idx)
+                        self._handle_savasiyor(
+                            w, hp_var, hp_fill, hp_fill_ready,
+                            cc, hwnd, now,
+                            client_idx=client_idx,
+                            target_generation=target_generation,
+                            sample_ts=data_ts,
+                            hp_sample_valid=hp_sample_valid,
+                        )
                 except Exception as e:
                     log_event(self.st, "error", f"ActionThread hatasi ({state}): {e}")
                     self.dur[w] = "ARANIYOR"  # gÃ¼venli sÄ±fÄ±rlama
@@ -1813,14 +2924,13 @@ class VisionThread(threading.Thread):
         super().__init__(daemon=True)
         self.cfg, self.st = cfg, state
         self._stop_event = threading.Event()
-        self.captcha_w = {1: None, 2: None}
+        self.captcha_w = {ci: None for ci in CLIENT_IDS}
         self.model_cache = {}
         self._captcha_last_log = {}
         self._captcha_watcher_started_t = {}
         self._last_debug_encode = {}
         self._message_last_action = {}
         self._message_last_reply = {}
-        self._message_sent_buffer = {}
         self._message_last_ocr = {}
         self._message_last_handled_incoming = {}
         self._message_handled_signatures = {}
@@ -1834,7 +2944,6 @@ class VisionThread(threading.Thread):
         self._window_issue_last_log = {}
         self._global_pause_last_warn = 0.0
         self._debug_encode_interval = 0.30
-        self._hp_frame_counter = {}
         self._started_at = time.time()
         self._hp_templates = {}  # ci â†’ {"gray": template_gray, "edges": template_edges, "w": w, "h": h}
         self._hp_template_cache = {}  # (ci, scale_key) â†’ scaled variant
@@ -1846,11 +2955,93 @@ class VisionThread(threading.Thread):
         self._prev_det = {}  # pk â†’ [(cx,cy),...] Ã¶nceki karedeki ham tespitler (ardÄ±ÅŸÄ±k kare doÄŸrulamasÄ± iÃ§in)
         self._prev_target_centers = {}  # pk -> {"ts": float, "centers": [(cx,cy),...]} iki kare hareket filtresi
         self._prev_scene_roi = {}  # pk â†’ son frame'in merkez ROI'si (hareketsiz tespiti iÃ§in)
+        self._scene_sample_t = {}
+        self._scene_motion_state = {}
+        self._scene_motion_votes = {}
+        self._hp_fill_hist = {}
+        self._hp_accepted_floor = {}
+        self._hp_presence_hist = {}
+        self._hp_generation_seen = {}
+        self._hp_diag_t = {}
+        self._hp_diag_signature = {}
+        self._hp_reject_t = {}
         self._load_hp_templates()
         self._load_message_templates()
 
     def stop(self):
         self._stop_event.set()
+
+    def _publish_client_vision(self, pk, data):
+        """Bir client sonucunu diger client'larin inference'ini bekletmeden yayinla."""
+        published = dict(data or {})
+        published["publish_ts"] = time.time()
+        with self.st.lk:
+            generation = int(published.get("target_generation", 0) or 0)
+            ts = float(published.get("ts", 0) or 0)
+            fill = published.get("hp_fill")
+            if (generation == int(self.st.target_generation.get(pk, 0) or 0)
+                    and ts > 0 and published.get("hp_var")
+                    and published.get("hp_fill_ready") and published.get("hp_sample_valid")
+                    and fill is not None and np.isfinite(fill) and 0 <= fill <= 1):
+                previous = self.st.target_hp_evidence.get(pk)
+                if previous is None or previous["generation"] != generation:
+                    self.st.target_hp_evidence[pk] = {"generation": generation, "fill": float(fill), "ts": ts}
+                elif ts > previous["ts"] and float(fill) < previous["fill"]:
+                    self.st.target_hp_evidence[pk] = {"generation": generation, "fill": float(fill), "ts": ts}
+            self.st.wdata[pk] = published
+        return published
+
+    def _publish_debug_frame(self, pk, encoded_frame):
+        if not encoded_frame:
+            return
+        with self.st.lk:
+            self.st.frame_b64[pk] = encoded_frame
+
+    def _sync_hp_generation(self, pk, frame_target_generation):
+        """Hedef degistiginde Vision tarafindaki tum HP oylarini sifirla."""
+        if not hasattr(self, "_hp_accepted_floor"):
+            self._hp_accepted_floor = {}
+        if not hasattr(self, "_hp_reject_t"):
+            self._hp_reject_t = {}
+        generation = int(frame_target_generation or 0)
+        if self._hp_generation_seen.get(pk) == generation:
+            return False
+        self._hp_generation_seen[pk] = generation
+        self._hp_fill_hist.pop(pk, None)
+        self._hp_accepted_floor.pop(pk, None)
+        self._hp_presence_hist.pop(pk, None)
+        self._hp_reject_t.pop(pk, None)
+        return True
+
+    def _measure_scene_motion(self, pk, image, now):
+        current = self._scene_motion_state.get(pk, {
+            "ready": False,
+            "moving": False,
+            "score": 0.0,
+            "confidence": 0.0,
+            "points": 0,
+        })
+        if now - float(self._scene_sample_t.get(pk, 0) or 0) < SCENE_SAMPLE_INTERVAL_SN:
+            return dict(current)
+
+        gray, mask = prepare_scene_frame(image)
+        if gray is None:
+            return dict(current)
+        previous = self._prev_scene_roi.get(pk)
+        self._prev_scene_roi[pk] = gray
+        self._scene_sample_t[pk] = now
+        measured = estimate_scene_motion(previous, gray, mask)
+        if not measured.get("ready"):
+            self._scene_motion_state[pk] = measured
+            return dict(measured)
+
+        votes = self._scene_motion_votes.setdefault(pk, deque(maxlen=3))
+        votes.append(bool(measured.get("moving", False)))
+        # Iki olumlu ornek hareketi baslatir; iki olumsuz ornek durdurur.
+        if len(votes) >= 2:
+            measured["moving"] = sum(1 for vote in votes if vote) >= 2
+        self._scene_motion_state[pk] = measured
+        return dict(measured)
 
     def _ensure_captcha_watcher(self, ci):
         cw = self.captcha_w.get(ci)
@@ -1867,7 +3058,11 @@ class VisionThread(threading.Thread):
         def _cb(level, msg):
             log_event(self.st, level, msg)
 
-        self.captcha_w[ci] = CaptchaWatcher(client_id=ci, log_cb=_cb)
+        self.captcha_w[ci] = CaptchaWatcher(
+            client_id=ci,
+            log_cb=_cb,
+            input_lock=input_transaction_lock,
+        )
         self._captcha_watcher_started_t[ci] = time.time()
         log_event(self.st, "info", f"Client {ci} captcha solver yukleniyor")
         return self.captcha_w[ci]
@@ -1914,17 +3109,39 @@ class VisionThread(threading.Thread):
         return result
 
     def _load_hp_templates(self):
-        for ci in [1, 2]:
+        self._hp_templates = {}
+        self._hp_template_cache = {}
+        for ci in CLIENT_IDS:
             tpl_path = os.path.join(HP_TEMPLATE_DIR, f"client_{ci}.png")
             if os.path.exists(tpl_path):
                 img = cv2.imread(tpl_path, cv2.IMREAD_COLOR)
                 if img is not None and img.size > 0:
                     h, w = img.shape[:2]
-                    if h >= 4 and w >= 12:
+                    if h >= 4 and w >= HP_TEMPLATE_MIN_WIDTH:
                         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                         edges = cv2.Canny(gray, 50, 150)
-                        self._hp_templates[ci] = {"gray": gray, "edges": edges, "w": w, "h": h}
+                        cc = self.cfg.client(ci)
+                        bar_box = None
+                        auto_bar = cc.get("hp_auto_bar_region")
+                        if cc.get("hp_panel_auto") and isinstance(auto_bar, (list, tuple)) and len(auto_bar) == 4:
+                            bar_box = (
+                                int(round(float(auto_bar[2]) * w)),
+                                int(round(float(auto_bar[0]) * h)),
+                                int(round((float(auto_bar[3]) - float(auto_bar[2])) * w)),
+                                int(round((float(auto_bar[1]) - float(auto_bar[0])) * h)),
+                            )
+                        mask = hp_panel_structure_mask((h, w), bar_box)
+                        self._hp_templates[ci] = {
+                            "gray": gray, "edges": edges, "mask": mask,
+                            "w": w, "h": h,
+                        }
                         log_event(self.st, "info", f"Client {ci} HP template yuklendi: {w}x{h}")
+                        if not cc.get("hp_panel_auto"):
+                            log_event(
+                                self.st,
+                                "warn",
+                                f"Client {ci} eski HP secimini kullaniyor; can %100 iken panelin tamamini yeniden secin",
+                            )
                     else:
                         log_event(self.st, "warn", f"Client {ci} HP template cok kucuk: {w}x{h}")
                 else:
@@ -1942,48 +3159,99 @@ class VisionThread(threading.Thread):
         if tpl is None:
             return None
         if abs(scale - 1.0) < 0.001:
-            result = {"gray": tpl["gray"], "edges": tpl["edges"], "w": tpl["w"], "h": tpl["h"]}
+            result = {
+                "gray": tpl["gray"], "edges": tpl["edges"], "mask": tpl.get("mask"),
+                "w": tpl["w"], "h": tpl["h"],
+            }
         else:
-            tw = max(12, int(round(tpl["w"] * scale)))
+            tw = max(HP_TEMPLATE_MIN_WIDTH, int(round(tpl["w"] * scale)))
             th = max(4, int(round(tpl["h"] * scale)))
             interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
             gray = cv2.resize(tpl["gray"], (tw, th), interpolation=interp)
             edges = cv2.Canny(gray, 50, 150)
-            result = {"gray": gray, "edges": edges, "w": tw, "h": th}
+            mask = tpl.get("mask")
+            if mask is not None:
+                mask = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+            result = {"gray": gray, "edges": edges, "mask": mask, "w": tw, "h": th}
         self._hp_template_cache[cache_key] = result
         return result
 
     def _match_hp_template(self, roi, ci):
         tpl = self._hp_templates.get(ci)
         if tpl is None or roi is None or roi.size == 0:
-            return {"matched": False, "score": 0.0, "x": 0, "y": 0, "w": 0, "h": 0}
+            return {"matched": False, "score": 0.0, "anchor_matched": False, "anchor_score": 0.0, "x": 0, "y": 0, "w": 0, "h": 0}
         roi_h, roi_w = roi.shape[:2]
-        if roi_h < 4 or roi_w < 12:
-            return {"matched": False, "score": 0.0, "x": 0, "y": 0, "w": 0, "h": 0}
-        best = {"matched": False, "score": 0.0, "x": 0, "y": 0, "w": 0, "h": 0}
+        if roi_h < 4 or roi_w < HP_TEMPLATE_MIN_WIDTH:
+            return {"matched": False, "score": 0.0, "anchor_matched": False, "anchor_score": 0.0, "x": 0, "y": 0, "w": 0, "h": 0}
+        best = {
+            "matched": False, "score": 0.0,
+            "structure_matched": False, "structure_score": 0.0,
+            "anchor_matched": False, "anchor_score": 0.0,
+            "x": 0, "y": 0, "w": 0, "h": 0,
+        }
+        best_structure_score = 0.0
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         roi_edges = cv2.Canny(roi_gray, 50, 150)
         
-        for scale in HP_TEMPLATE_SCALES:
+        scales = (1.0,) if int(tpl.get("w", 0)) >= 80 else HP_TEMPLATE_SCALES
+        for scale in scales:
             variant = self._get_scaled_template(ci, scale)
             if variant is None:
                 continue
             th, tw = variant["h"], variant["w"]
-            if th > roi_h or tw > roi_w or th < 4 or tw < 12:
+            if th > roi_h or tw > roi_w or th < 4 or tw < HP_TEMPLATE_MIN_WIDTH:
                 continue
-            roi_resized = cv2.resize(roi_gray, (tw, th), interpolation=cv2.INTER_AREA)
-            score_gray = float(cv2.matchTemplate(roi_resized, variant["gray"], cv2.TM_CCOEFF_NORMED)[0][0])
-            
-            roi_edges_resized = cv2.resize(roi_edges, (tw, th), interpolation=cv2.INTER_AREA)
-            score_edges = float(cv2.matchTemplate(roi_edges_resized, variant["edges"], cv2.TM_CCOEFF_NORMED)[0][0])
-            
-            score = max(score_gray, score_edges)
+            gray_scores = cv2.matchTemplate(roi_gray, variant["gray"], cv2.TM_CCOEFF_NORMED)
+            _gray_min, score_gray, _gray_min_loc, gray_loc = cv2.minMaxLoc(gray_scores)
+
+            edge_loc = gray_loc
+            score_edges = 0.0
+            mask = variant.get("mask")
+            try:
+                if mask is not None and np.count_nonzero(mask) >= 8:
+                    edge_scores = cv2.matchTemplate(
+                        roi_edges,
+                        variant["edges"],
+                        cv2.TM_CCORR_NORMED,
+                        mask=mask,
+                    )
+                else:
+                    edge_scores = cv2.matchTemplate(roi_edges, variant["edges"], cv2.TM_CCOEFF_NORMED)
+                edge_scores = np.nan_to_num(edge_scores, nan=0.0, posinf=0.0, neginf=0.0)
+                _edge_min, score_edges, _edge_min_loc, edge_loc = cv2.minMaxLoc(edge_scores)
+            except cv2.error:
+                score_edges = 0.0
+
+            score_gray = float(np.nan_to_num(score_gray, nan=0.0, posinf=0.0, neginf=0.0))
+            score_edges = float(score_edges)
+            best_structure_score = max(best_structure_score, score_edges)
+            if score_edges >= score_gray:
+                score, best_loc = score_edges, edge_loc
+            else:
+                score, best_loc = score_gray, gray_loc
             if score > best["score"]:
-                best = {"matched": score >= HP_TEMPLATE_MIN_SCORE, "score": score, "x": 0, "y": 0, "w": tw, "h": th}
+                best = {
+                    "matched": score >= HP_TEMPLATE_MIN_SCORE,
+                    "score": score,
+                    "anchor_matched": False,
+                    "anchor_score": 0.0,
+                    "x": int(best_loc[0]), "y": int(best_loc[1]),
+                    "w": tw, "h": th,
+                }
+
+        anchor_result = match_hp_panel_anchor(roi, tpl.get("gray"))
+        best["anchor_matched"] = bool(anchor_result.get("matched"))
+        best["anchor_score"] = float(anchor_result.get("score", 0.0) or 0.0)
+        best["structure_score"] = max(best_structure_score, best["anchor_score"])
+        best["structure_matched"] = bool(
+            best_structure_score >= HP_TEMPLATE_MIN_SCORE or best["anchor_matched"]
+        )
+        best["matched"] = bool(best.get("matched") or best["anchor_matched"])
+        best["score"] = max(float(best.get("score", 0.0) or 0.0), best["anchor_score"])
         return best
 
     def _unload_ocr(self):
-        for ci in [1, 2]:
+        for ci in CLIENT_IDS:
             cw = self.captcha_w.get(ci)
             if cw:
                 with cw._lock:
@@ -1996,7 +3264,7 @@ class VisionThread(threading.Thread):
 
     def _active_client_pks(self):
         keys = []
-        for ci in [1, 2]:
+        for ci in CLIENT_IDS:
             cc = self.cfg.client(ci)
             if not cc.get("aktif", True):
                 continue
@@ -2005,37 +3273,30 @@ class VisionThread(threading.Thread):
                 keys.append(pk)
         return keys
 
-    def _set_global_pause_state(self, kind, owner_pk, owner_ci=None, reason=""):
-        now = time.time()
+    def _clear_orphaned_input_locks(self):
+        """Release only locks owned by a removed or definitively closed window."""
+        active_keys = set(self._active_client_pks())
         with self.st.lk:
-            prev_active = self.st.global_pause_active
-            prev_kind = self.st.global_pause_kind
-            prev_owner = self.st.global_pause_owner
-            self.st.global_pause_active = True
-            self.st.global_pause_kind = kind
-            self.st.global_pause_owner = owner_pk
-            self.st.global_pause_reason = reason or kind
-            if not self.st.global_pause_since or prev_kind != kind or prev_owner != owner_pk:
-                self.st.global_pause_since = now
-        if not prev_active or prev_kind != kind or prev_owner != owner_pk:
-            label = f"Client {owner_ci}" if owner_ci else owner_pk
-            log_event(self.st, "warn", f"[PAUSE] {kind} aktif: owner={label} reason={reason or kind}")
-
-    def _clear_global_pause_state(self, kind=None, reason=""):
-        with self.st.lk:
-            if kind and self.st.global_pause_kind != kind:
-                return False
-            was_active = self.st.global_pause_active
-            old_kind = self.st.global_pause_kind
-            self.st.global_pause_active = False
-            self.st.global_pause_kind = ""
-            self.st.global_pause_owner = None
-            self.st.global_pause_reason = ""
-            self.st.global_pause_since = 0.0
-        if was_active:
-            suffix = f": {reason}" if reason else ""
-            log_event(self.st, "info", f"[PAUSE] {old_kind} temizlendi{suffix}")
-        return was_active
+            owners = (
+                (self.st.captcha_global_active, self.st.captcha_global_owner,
+                 self._clear_global_captcha),
+                (self.st.message_global_active, self.st.message_global_owner,
+                 self._clear_global_message),
+            )
+        for active, owner, clear in owners:
+            if not active or not owner:
+                continue
+            if owner not in active_keys:
+                clear("owner inactive")
+                continue
+            try:
+                hwnd = hwnd_al(owner)
+                closed = bool(hwnd) and not win32gui.IsWindow(hwnd)
+            except Exception:
+                # A failed probe is not proof of closure. Keep the safety lock.
+                continue
+            if closed:
+                clear("owner window closed")
 
     def _log_window_issue(self, ci, pk, issue, message):
         key = (ci, pk, issue)
@@ -2062,17 +3323,18 @@ class VisionThread(threading.Thread):
     def _set_global_captcha(self, owner_pk, owner_ci=None, reason="CAPTCHA"):
         now = time.time()
         should_log = False
-        with self.st.lk:
-            prev_active = self.st.captcha_global_active
-            prev_owner = self.st.captcha_global_owner
-            self.st.captcha_global_active = True
-            self.st.captcha_global_owner = owner_pk
-            if not self.st.captcha_global_since:
-                self.st.captcha_global_since = now
-            self.st.captcha_block[owner_pk] = True
-            self.st.captcha_state[owner_pk] = True
-            self.st.durum[owner_pk] = "CAPTCHA"
-            should_log = (not prev_active) or (prev_owner != owner_pk)
+        with input_transaction_lock:
+            with self.st.lk:
+                prev_active = self.st.captcha_global_active
+                prev_owner = self.st.captcha_global_owner
+                self.st.captcha_global_active = True
+                self.st.captcha_global_owner = owner_pk
+                if not self.st.captcha_global_since:
+                    self.st.captcha_global_since = now
+                self.st.captcha_block[owner_pk] = True
+                self.st.captcha_state[owner_pk] = True
+                self.st.durum[owner_pk] = "CAPTCHA"
+                should_log = (not prev_active) or (prev_owner != owner_pk)
         if should_log:
             label = f"Client {owner_ci}" if owner_ci else owner_pk
             log_event(self.st, "warn", f"{label} captcha islemi aktif: {reason}")
@@ -2105,7 +3367,7 @@ class VisionThread(threading.Thread):
 
     def _warn_duplicate_client_windows(self):
         pairs = []
-        for ci in (1, 2):
+        for ci in CLIENT_IDS:
             cc = self.cfg.client(ci)
             if not cc.get("aktif", True):
                 continue
@@ -2126,17 +3388,18 @@ class VisionThread(threading.Thread):
     def _set_global_message(self, owner_pk, owner_ci=None, reason="MESAJ"):
         now = time.time()
         should_log = False
-        with self.st.lk:
-            prev_active = self.st.message_global_active
-            prev_owner = self.st.message_global_owner
-            self.st.message_global_active = True
-            self.st.message_global_owner = owner_pk
-            if not self.st.message_global_since:
-                self.st.message_global_since = now
-            self.st.captcha_block[owner_pk] = True
-            self.st.captcha_state[owner_pk] = True
-            self.st.durum[owner_pk] = "MESAJ"
-            should_log = (not prev_active) or (prev_owner != owner_pk)
+        with input_transaction_lock:
+            with self.st.lk:
+                prev_active = self.st.message_global_active
+                prev_owner = self.st.message_global_owner
+                self.st.message_global_active = True
+                self.st.message_global_owner = owner_pk
+                if not self.st.message_global_since:
+                    self.st.message_global_since = now
+                self.st.captcha_block[owner_pk] = True
+                self.st.captcha_state[owner_pk] = True
+                self.st.durum[owner_pk] = "MESAJ"
+                should_log = (not prev_active) or (prev_owner != owner_pk)
         if should_log:
             label = f"Client {owner_ci}" if owner_ci else owner_pk
             log_event(self.st, "warn", f"{label} [MESAJ] islemi aktif: {reason}")
@@ -2594,22 +3857,6 @@ class VisionThread(threading.Thread):
             return 0.0
         return difflib.SequenceMatcher(None, aa, bb).ratio()
 
-    def _is_self_message_text(self, pk, text):
-        clean = self._clean_message_text(text)
-        low = clean.lower()
-        if any(low.startswith(prefix) for prefix in MESSAGE_SELF_NAME_PREFIXES):
-            return True
-        now = time.time()
-        buf = list(self._message_sent_buffer.get(pk, []))
-        for item in buf:
-            sent_text = item.get("text", "") if isinstance(item, dict) else str(item)
-            sent_ts = float(item.get("ts", 0) or 0) if isinstance(item, dict) else 0.0
-            if sent_ts and now - sent_ts > max(30.0, MESSAGE_SELF_ECHO_SECONDS):
-                continue
-            if self._message_text_similarity(clean, sent_text) >= MESSAGE_SELF_ECHO_SIMILARITY:
-                return True
-        return False
-
     def _extract_incoming_message_text(self, ci, pk, img):
         candidates = self._read_yellow_message_lines(ci, pk, img, include_seen=False)
         if not candidates:
@@ -2789,8 +4036,6 @@ class VisionThread(threading.Thread):
             if notification:
                 self._message_open_allowed[mk] = True
             if ok:
-                buf = self._message_sent_buffer.setdefault(mk, deque(maxlen=5))
-                buf.append({"text": reply_text, "ts": time.time()})
                 if incoming_text:
                     self._message_last_handled_incoming[mk] = incoming_text
                     pending_sig = self._message_pending_signature.pop(mk, None)
@@ -2817,7 +4062,7 @@ class VisionThread(threading.Thread):
 
     def run(self):
         try:
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            dev = preferred_backend()
             with self.st.lk: self.st.cihaz = dev
             log_event(self.st, "info", f"Vision cihazi: {dev}")
         except:
@@ -2852,16 +4097,7 @@ class VisionThread(threading.Thread):
                     break
                 continue
 
-            with self.st.lk:
-                global_active = self.st.captcha_global_active
-                global_owner = self.st.captcha_global_owner
-                message_active = self.st.message_global_active
-                message_owner = self.st.message_global_owner
-            active_client_pks = self._active_client_pks()
-            if global_active and global_owner and global_owner not in active_client_pks:
-                self._clear_global_captcha("owner inactive")
-            if message_active and message_owner and message_owner not in active_client_pks:
-                self._clear_global_message("owner inactive")
+            self._clear_orphaned_input_locks()
             self._watch_global_pause()
 
             guncel = {}
@@ -2869,14 +4105,31 @@ class VisionThread(threading.Thread):
                 b64_frames = dict(self.st.frame_b64)
             active_keys = set()
             self._warn_duplicate_client_windows()
+            runtime_client_configs = {ci: self.cfg.client(ci) for ci in CLIENT_IDS}
+            blocked_client_ids = duplicate_client_ids(runtime_client_configs)
 
-            for ci in [1,2]:
-                cc = self.cfg.client(ci)
+            for ci in CLIENT_IDS:
+                cc = runtime_client_configs[ci]
                 if not cc.get("aktif", True):
                     continue
                 pk = cc.get("pencere","Yok")
                 if pk == "Yok": continue
+                # Eski/elle duzenlenmis ayarlarda cakisma bulunursa hicbir
+                # tarafa oncelik verme; boylece yanlis client'a input gidemez.
+                if ci in blocked_client_ids:
+                    self._log_window_issue(
+                        ci,
+                        pk,
+                        "duplicate",
+                        f"Client {ci} atlandi: pencere baska aktif Client ile cakismali ({pk})",
+                    )
+                    continue
                 active_keys.add(pk)
+                # Bu etiket ekran yakalanmadan once okunur. Hedef tiklamasi
+                # inference devam ederken olursa, eski kare yeni hedefe aitmis
+                # gibi kullanilmaz.
+                with self.st.lk:
+                    frame_target_generation = int(self.st.target_generation.get(pk, 0) or 0)
 
                 hwnd = hwnd_al(pk)
                 mon = _sct.monitors[1]; ox,oy = 0,0
@@ -2901,39 +4154,80 @@ class VisionThread(threading.Thread):
 
                 ecx, ecy = mon["width"]//2, mon["height"]//2
                 hp_region = cc.get("hp_region", [0.02, 0.07, 0.30, 0.70])
-                y1h = int(hp_region[0] * mon["height"])
-                y2h = int(hp_region[1] * mon["height"])
-                x1h = int(hp_region[2] * mon["width"])
-                x2h = int(hp_region[3] * mon["width"])
+                y1h = max(0, min(mon["height"], int(hp_region[0] * mon["height"])))
+                y2h = max(0, min(mon["height"], int(hp_region[1] * mon["height"])))
+                x1h = max(0, min(mon["width"], int(hp_region[2] * mon["width"])))
+                x2h = max(0, min(mon["width"], int(hp_region[3] * mon["width"])))
+                panel_width = max(0, x2h - x1h)
+                panel_height = max(0, y2h - y1h)
+
+                auto_bar_region = cc.get("hp_auto_bar_region")
+                hp_panel_auto_ready = bool(
+                    cc.get("hp_panel_auto")
+                    and isinstance(auto_bar_region, (list, tuple))
+                    and len(auto_bar_region) == 4
+                    and panel_width >= 40
+                    and panel_height >= 12
+                )
+                auto_bar_local = None
+                if hp_panel_auto_ready:
+                    aby1 = max(0, min(panel_height, int(round(float(auto_bar_region[0]) * panel_height))))
+                    aby2 = max(0, min(panel_height, int(round(float(auto_bar_region[1]) * panel_height))))
+                    abx1 = max(0, min(panel_width, int(round(float(auto_bar_region[2]) * panel_width))))
+                    abx2 = max(0, min(panel_width, int(round(float(auto_bar_region[3]) * panel_width))))
+                    if aby2 > aby1 and abx2 > abx1:
+                        auto_bar_local = (abx1, aby1, abx2 - abx1, aby2 - aby1)
+                    else:
+                        hp_panel_auto_ready = False
+
+                hp_fill_region = cc.get("hp_fill_region")
+                hp_fill_ready = hp_panel_auto_ready or bool(
+                    cc.get("hp_fill_region_custom")
+                    and isinstance(hp_fill_region, (list, tuple))
+                    and len(hp_fill_region) == 4
+                )
+                fill_box = None
+                if hp_panel_auto_ready and auto_bar_local:
+                    abx, aby, abw, abh = auto_bar_local
+                    fill_box = (x1h + abx, y1h + aby, x1h + abx + abw, y1h + aby + abh)
+                elif hp_fill_ready:
+                    fy1 = max(0, min(mon["height"], int(hp_fill_region[0] * mon["height"])))
+                    fy2 = max(0, min(mon["height"], int(hp_fill_region[1] * mon["height"])))
+                    fx1 = max(0, min(mon["width"], int(hp_fill_region[2] * mon["width"])))
+                    fx2 = max(0, min(mon["width"], int(hp_fill_region[3] * mon["width"])))
+                    if fy2 > fy1 and fx2 > fx1:
+                        fill_box = (fx1, fy1, fx2, fy2)
+                    else:
+                        hp_fill_ready = False
                 try: img = cv2.cvtColor(np.array(_sct.grab(mon),dtype=np.uint8), cv2.COLOR_BGRA2BGR)
                 except:
                     self._log_window_issue(ci, pk, "capture", f"Client {ci} ekran capture basarisiz")
                     with self.st.lk:
                         self.st.durum[pk] = "CAPTURE HATA"
                     continue
+                frame_capture_ts = time.time()
+                death = detect_death_menu(img)
+                death.update(ts=frame_capture_ts, hwnd=hwnd, own_hp=own_hp_visible(img),
+                             foreground=bool(hwnd and win32gui.GetForegroundWindow() == hwnd))
+                with self.st.lk:
+                    if not hasattr(self.st, "life_data"):
+                        self.st.life_data = {}
+                    self.st.life_data[pk] = death
+                if death.get("visible"):
+                    guncel[pk] = self._publish_client_vision(pk, {"merkezler": [], "hp_var": False,
+                        "hwnd": hwnd, "client_cfg": cc, "client_idx": ci,
+                        "ts": frame_capture_ts, "target_generation": frame_target_generation})
+                    continue
 
-                # â”€â”€ KOORDÄ°NAT BAZLI HAREKETSÄ°Z TESPÄ°TÄ° â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                # Merkez %40'lÄ±k bÃ¶lgeyi 32x32'ye indirge, Ã¶nceki frame ile karÅŸÄ±laÅŸtÄ±r
+                # Dunyadaki sabit detaylari seyrek optik akisla izle. Yerel mob ve
+                # beceri animasyonlari yerine genis alana yayilan tutarli kayma aranir.
                 try:
-                    fh, fw = img.shape[:2]
-                    _y1 = fh * 3 // 10; _y2 = fh * 7 // 10
-                    _x1 = fw * 3 // 10; _x2 = fw * 7 // 10
-                    roi_small = cv2.resize(
-                        cv2.cvtColor(img[_y1:_y2, _x1:_x2], cv2.COLOR_BGR2GRAY),
-                        (32, 32), interpolation=cv2.INTER_AREA
-                    ).astype(np.float32)
-                    prev_roi = self._prev_scene_roi.get(pk)
-                    if prev_roi is None:
-                        scene_moved = True
-                    else:
-                        diff = float(np.mean(np.abs(roi_small - prev_roi)))
-                        scene_moved = diff > 6.0   # kucuk HP/mob animasyonlari sayaci resetlemesin
-                    self._prev_scene_roi[pk] = roi_small
-                    if scene_moved:
-                        with self.st.lk:
-                            self.st.scene_changed_t[pk] = time.time()
+                    scene_motion = self._measure_scene_motion(pk, img, time.time())
                 except Exception:
-                    pass
+                    scene_motion = {
+                        "ready": False, "moving": False, "score": 0.0,
+                        "confidence": 0.0, "points": 0,
+                    }
                 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
                 # â”€â”€ CAPTCHA â”€â”€
@@ -2947,6 +4241,7 @@ class VisionThread(threading.Thread):
                     "tip2": bool(cc.get("captcha_tip2", False)),
                     "tip3": bool(cc.get("captcha_tip3", False)),
                     "tip4": bool(cc.get("captcha_tip4", False)),
+                    "rumeli2": bool(cc.get("captcha_rumeli2", False)),
                 }
                 base_captcha_enabled = bool(cc.get("captcha", True))
                 captcha_enabled = base_captcha_enabled or any(enabled_tips.values())
@@ -2970,6 +4265,10 @@ class VisionThread(threading.Thread):
                         continue
                     try:
                         cw.set_enabled_tips(enabled_tips)
+                        cw.set_rumeli2_regions(
+                            cc.get("rumeli2_question_region"),
+                            cc.get("rumeli2_option_regions", []),
+                        )
                     except Exception:
                         pass
                     status = getattr(cw, "last_status", "")
@@ -2988,14 +4287,34 @@ class VisionThread(threading.Thread):
                         captcha_bulundu = cw.kontrol_et(img, ox, oy, hwnd)
                         status = getattr(cw, "last_status", "")
                         detail = getattr(cw, "last_detail", "")
+                        config_only_status = status in (
+                            "rumeli2_kalibrasyon_yok",
+                            "rumeli2_referans_yok",
+                            "template_yok",
+                        )
                         # Her loop'ta status log'la (throttled)
-                        if status != "dialog_yok":
+                        if status not in (
+                            "dialog_yok",
+                            "rumeli2_kalibrasyon_yok",
+                            "rumeli2_referans_yok",
+                            "template_yok",
+                        ):
                             log_key = (ci, "status_check")
                             last_log = self._captcha_last_log.get(log_key, 0)
                             if time.time() - last_log > 5:
                                 log_event(self.st, "info", f"Client {ci} captcha status: {status}{(' - ' + detail) if detail else ''}")
                                 self._captcha_last_log[log_key] = time.time()
-                        if status in ("hedef_yok", "eslesme_yok", "ocr_yok", "ocr_hata", "tip_yok", "grid_yok", "grid_az", "farkli_yok"):
+                        elif config_only_status:
+                            log_key = (ci, "captcha_config")
+                            last_log = self._captcha_last_log.get(log_key, 0)
+                            if time.time() - last_log > 30:
+                                log_event(
+                                    self.st,
+                                    "warn",
+                                    f"Client {ci} CAPTCHA kalibrasyonu eksik; farm ve canli goruntu engellenmeden devam ediyor",
+                                )
+                                self._captcha_last_log[log_key] = time.time()
+                        if status in ("hedef_yok", "eslesme_yok", "ocr_yok", "ocr_hata", "tip_yok", "grid_yok", "grid_az", "farkli_yok", "rumeli2_belirsiz"):
                             key = (ci, status, detail)
                             last = self._captcha_last_log.get(key, 0)
                             if time.time() - last > 3:
@@ -3013,22 +4332,24 @@ class VisionThread(threading.Thread):
                                         small = cv2.resize(img, (640,360)) if img.shape[1] > 700 else img
                                         _,buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 30])
                                         b64_frames[pk] = base64.b64encode(buf.tobytes()).decode()
+                                        self._publish_debug_frame(pk, b64_frames[pk])
                                         self._last_debug_encode[pk] = now
                                     except:
                                         pass
                             continue
                     if captcha_waiting_for_ocr:
                         continue
-                    if status == "dialog_yok":
+                    if not captcha_status_blocks_input(status):
                         with self.st.lk:
-                            if time.time() >= self.st.captcha_cd.get(pk, 0):
+                            cooldown_finished = time.time() >= self.st.captcha_cd.get(pk, 0)
+                            if config_only_status or cooldown_finished:
                                 self.st.captcha_block[pk] = False
                                 self.st.captcha_state[pk] = False
                                 is_global_owner = self.st.captcha_global_owner == pk
                             else:
                                 is_global_owner = False
                         if is_global_owner:
-                            self._clear_global_captcha("owner dialog_yok")
+                            self._clear_global_captcha(f"owner non-blocking status: {status or 'bos'}")
                     else:
                         self._set_global_captcha(pk, ci, status or "captcha kontrol")
                         continue
@@ -3051,22 +4372,27 @@ class VisionThread(threading.Thread):
                 model = self.model_cache.get(model_path)
                 if model is None:
                     try:
-                        model = YOLO(model_path)
+                        model = create_detection_model(
+                            model_path,
+                            log_cb=lambda level, message: log_event(self.st, level, message),
+                        )
                         dummy_size = 640
                         model(np.zeros((dummy_size,dummy_size,3),dtype=np.uint8), verbose=False)
                         self.model_cache[model_path] = model
+                        with self.st.lk:
+                            self.st.cihaz = model.backend_name
                     except:
                         continue
 
                 conf = FIXED_CONF_ESIK
                 imgsz = 640
-                half = (dev == "cuda")
+                quantize = 16 if getattr(model, "backend_name", "cpu") == "cuda" else None
                 
-                res = model(img, stream=True, verbose=False, conf=conf, half=half, imgsz=imgsz, iou=0.45)
+                res = model(img, stream=True, verbose=False, conf=conf, quantize=quantize, imgsz=imgsz, iou=0.45)
                 mrk, kut, hedefler = [], [], []
                 stable_mrk = []
                 tum_ham_pos = []  # Bu karedeki TÃœM ham tespitler (ardÄ±ÅŸÄ±k doÄŸrulama iÃ§in saklanÄ±r)
-                frame_ts = time.time()
+                frame_ts = frame_capture_ts
                 prev_target = self._prev_target_centers.get(pk) or {}
                 prev_target_ts = float(prev_target.get("ts", 0.0) or 0.0)
                 prev_target_centers = prev_target.get("centers") or []
@@ -3096,7 +4422,7 @@ class VisionThread(threading.Thread):
                         click_x = int((b1 + b3) / 2)
                         click_y = int(b2 + (h_box * 0.56))
 
-                        # TÃ¼m tespitleri debug iÃ§in gÃ¶ster, kuyruk yalnÄ±zca doÄŸrulanmÄ±ÅŸ hedefe tÄ±klar.
+                        # Tum tespitleri debug icin goster; tiklama adaylari asagida iki karede dogrulanir.
                         tum_ham_pos.append((cx, cy))
                         mrk.append((cx, cy))
                         kut.append((b1,b2,b3,b4,float(cfs[i])))
@@ -3165,22 +4491,208 @@ class VisionThread(threading.Thread):
                     if not temiz and not mrk and tm.get("last_confirmed_pos") and tm["misses"] < MISS_TOLERANS:
                         temiz = [tm["last_confirmed_pos"]]
 
-                roi = img[y1h:y2h, x1h:x2h]
+                self._sync_hp_generation(pk, frame_target_generation)
+
+                search_margin = HP_PANEL_SEARCH_MARGIN if hp_panel_auto_ready else 3
+                hsx1 = max(0, x1h - search_margin)
+                hsy1 = max(0, y1h - search_margin)
+                hsx2 = min(mon["width"], x2h + search_margin)
+                hsy2 = min(mon["height"], y2h + search_margin)
+                roi = img[hsy1:hsy2, hsx1:hsx2]
                 hp_result = self._match_hp_template(roi, ci)
+                structure_matched = bool(hp_result.get("structure_matched"))
+
+                auto_bar_result = None
+                credible_bar = False
+                raw_visible = False
+                was_confirmed = False
+                presence_votes = 0
+                presence_total = 0
+                if hp_panel_auto_ready and auto_bar_local:
+                    abx, aby, abw, abh = auto_bar_local
+                    expected_bar = (
+                        (x1h - hsx1) + abx,
+                        (y1h - hsy1) + aby,
+                        abw,
+                        abh,
+                    )
+                    auto_bar_result = locate_hp_bar(
+                        roi,
+                        expected_box=expected_bar,
+                        search_margin=search_margin,
+                        # Rumeli2 hedef panelinin yatay yerlesimi hedef adina
+                        # gore degisebiliyor. Dikey hizada kal, fakat kirmizi
+                        # cubugu secilen panelin tum genisliginde ara.
+                        horizontal_search_margin=panel_width,
+                    )
+
+                    presence_hist = self._hp_presence_hist.setdefault(
+                        pk,
+                        deque(maxlen=HP_PANEL_CONFIRM_FRAMES),
+                    )
+                    was_confirmed = sum(1 for value in presence_hist if value) >= HP_PANEL_CONFIRM_VOTES
+                    credible_bar = is_credible_hp_bar(
+                        auto_bar_result,
+                        was_confirmed=was_confirmed,
+                        min_initial_fill=HP_PANEL_MIN_INITIAL_FILL,
+                    )
+                    raw_visible = hp_panel_presence_vote(
+                        credible_bar,
+                        structure_matched,
+                        was_confirmed=was_confirmed,
+                    )
+                    presence_hist.append(raw_visible)
+                    presence_votes = sum(1 for value in presence_hist if value)
+                    presence_total = len(presence_hist)
+                    hp_var = (
+                        len(presence_hist) >= HP_PANEL_CONFIRM_VOTES
+                        and presence_votes >= HP_PANEL_CONFIRM_VOTES
+                    )
+                    hp_result["score"] = max(
+                        float(hp_result.get("score", 0.0) or 0.0),
+                        float(auto_bar_result.get("score", 0.0) or 0.0),
+                    )
+                    hp_result["matched"] = hp_var
+                else:
+                    self._hp_presence_hist.pop(pk, None)
+                    hp_var = bool(hp_result.get("matched", False))
+
                 self._hp_last_result = getattr(self, '_hp_last_result', {})
                 self._hp_last_result[pk] = hp_result
                 self._hp_score_hist = getattr(self, '_hp_score_hist', {})
                 self._hp_score_hist.pop(pk, None)
                 hp_px = int(hp_result["score"] * 10000)  # score -> px format (UI uyumu)
 
-                # HP tespiti anlik template esigini kullanir. Ortalama/cache burada gecikme
-                # urettigi icin HP kaybolunca debug cercevesi hemen kirmiziya donmeli.
-                hp_var = bool(hp_result.get("matched", False))
+                hp_fill = None
+                hp_fill_raw = None
+                hp_fill_samples = 0
+                hp_sample_valid = False
+                hp_sample_rejected_reason = ""
+                hp_previous_accepted = self._hp_accepted_floor.get(pk)
+                if hp_panel_auto_ready and auto_bar_result is not None:
+                    if auto_bar_result.get("bar_box"):
+                        bx, by, bw, bh = auto_bar_result["bar_box"]
+                        fill_box = (hsx1 + bx, hsy1 + by, hsx1 + bx + bw, hsy1 + by + bh)
+                    # Dolgu yalnizca ayni karede sabit panel cercevesi de
+                    # dogrulandiysa kullanilir. Cerceve kayipken gorulen kirmizi
+                    # dunya/UI parcalari HP zaman serisini kirletemez.
+                    candidate_fill = (
+                        auto_bar_result.get("fill")
+                        if credible_bar and structure_matched
+                        else None
+                    )
+                    hist = self._hp_fill_hist.setdefault(pk, deque(maxlen=5))
+                    if candidate_fill is not None:
+                        if is_plausible_hp_sample(
+                            hp_previous_accepted,
+                            candidate_fill,
+                            HP_MAX_UPWARD_JUMP,
+                        ):
+                            hp_fill_raw = float(candidate_fill)
+                            hist.append(hp_fill_raw)
+                            self._hp_accepted_floor[pk] = (
+                                hp_fill_raw if hp_previous_accepted is None
+                                else min(float(hp_previous_accepted), hp_fill_raw)
+                            )
+                            hp_sample_valid = True
+                        else:
+                            hp_sample_rejected_reason = "imkansiz_can_artisi"
+                    if hist and hp_var:
+                        hp_fill = float(np.median(np.asarray(hist, dtype=np.float32)))
+                    hp_fill_samples = len(hist)
+                elif hp_var and hp_fill_ready and fill_box:
+                    fx1, fy1, fx2, fy2 = fill_box
+                    candidate_fill = estimate_red_fill(img[fy1:fy2, fx1:fx2])
+                    hist = self._hp_fill_hist.setdefault(pk, deque(maxlen=5))
+                    if candidate_fill is not None and is_plausible_hp_sample(
+                        hp_previous_accepted,
+                        candidate_fill,
+                        HP_MAX_UPWARD_JUMP,
+                    ):
+                        hp_fill_raw = float(candidate_fill)
+                        hist.append(hp_fill_raw)
+                        self._hp_accepted_floor[pk] = (
+                            hp_fill_raw if hp_previous_accepted is None
+                            else min(float(hp_previous_accepted), hp_fill_raw)
+                        )
+                        hp_sample_valid = True
+                        hp_fill = float(np.median(np.asarray(hist, dtype=np.float32)))
+                    elif candidate_fill is not None:
+                        hp_sample_rejected_reason = "imkansiz_can_artisi"
+                    hp_fill_samples = len(hist)
+                else:
+                    self._hp_fill_hist.pop(pk, None)
 
-                guncel[pk] = {"merkezler":temiz,"live_merkezler":list(mrk),"hedefler":hedefler,"hp_var":hp_var,"hp_piksel":hp_px,
-                              "ekran_merkez":(ecx,ecy),"offset":(ox,oy),
-                              "hwnd":hwnd,"client_cfg":cc, "client_idx": ci,
-                              "ts": time.time()}
+                red_box = (auto_bar_result or {}).get("red_box") or (0, 0, 0, 0)
+                expected_bar_width = int(auto_bar_local[2]) if auto_bar_local else 0
+                detected_bar_width = int(red_box[2]) if len(red_box) >= 3 else 0
+                hp_bar_score = float((auto_bar_result or {}).get("score", 0.0) or 0.0)
+                hp_anchor_score = float(hp_result.get("structure_score", 0.0) or 0.0)
+                raw_text = "--" if hp_fill_raw is None else f"{float(hp_fill_raw) * 100:.1f}"
+                median_text = "--" if hp_fill is None else f"{float(hp_fill) * 100:.1f}"
+                signature = (
+                    bool(hp_var), bool(raw_visible), round(float(hp_fill_raw or -1.0), 3),
+                    bool(hp_sample_valid), hp_sample_rejected_reason,
+                    presence_votes, presence_total, frame_target_generation,
+                )
+                diag_now = time.time()
+                if hp_sample_rejected_reason:
+                    last_reject = float(self._hp_reject_t.get(pk, 0) or 0)
+                    if diag_now - last_reject >= HP_DIAGNOSTIC_INTERVAL_SN:
+                        self._hp_reject_t[pk] = diag_now
+                        previous_text = (
+                            "--" if hp_previous_accepted is None
+                            else f"{float(hp_previous_accepted) * 100:.1f}"
+                        )
+                        candidate_text = (
+                            "--" if candidate_fill is None
+                            else f"{float(candidate_fill) * 100:.1f}"
+                        )
+                        log_event(
+                            self.st,
+                            "warn",
+                            f"[HP-C{ci}] G{frame_target_generation} imkansiz can artisi "
+                            f"reddedildi: once=%{previous_text} simdi=%{candidate_text}; "
+                            f"karar uretilmedi ({pk})",
+                        )
+                with self.st.lk:
+                    action_state = self.st.durum.get(pk, "?")
+                diag_active = action_state in ("DOGRULAMA", "SAVASIYOR", "LOOT") or hp_var or was_confirmed
+                signature_changed = self._hp_diag_signature.get(pk) != signature
+                if diag_active and (
+                    signature_changed
+                    or diag_now - float(self._hp_diag_t.get(pk, 0) or 0) >= HP_DIAGNOSTIC_INTERVAL_SN
+                ):
+                    self._hp_diag_t[pk] = diag_now
+                    self._hp_diag_signature[pk] = signature
+                    log_event(
+                        self.st,
+                        "debug",
+                        f"[HP-C{ci}] G{frame_target_generation} durum={action_state} "
+                        f"panel={int(hp_var)} oy={presence_votes}/{presence_total} "
+                        f"ham=%{raw_text} medyan=%{median_text} ornek={hp_fill_samples} "
+                        f"ornek_gecerli={int(hp_sample_valid)} "
+                        f"dolgu_px={detected_bar_width}/{expected_bar_width} "
+                        f"bar_skor={hp_bar_score:.2f} cerceve_skor={hp_anchor_score:.2f} ({pk})",
+                    )
+
+                client_data = {"merkezler":temiz,"live_merkezler":list(mrk),"hedefler":hedefler,"hp_var":hp_var,"hp_piksel":hp_px,
+                               "hp_fill":hp_fill,"hp_fill_raw":hp_fill_raw,
+                               "hp_fill_samples":hp_fill_samples,"hp_fill_ready":hp_fill_ready,
+                               "hp_sample_valid":hp_sample_valid,
+                               "hp_sample_rejected_reason":hp_sample_rejected_reason,
+                               "hp_structure_matched":structure_matched,
+                               "hp_bar_width":detected_bar_width,"hp_bar_expected_width":expected_bar_width,
+                               "hp_bar_score":hp_bar_score,"hp_anchor_score":hp_anchor_score,
+                               "hp_presence_votes":presence_votes,"hp_presence_total":presence_total,
+                               "scene_moving":bool(scene_motion.get("moving", False)),
+                               "scene_motion_ready":bool(scene_motion.get("ready", False)),
+                               "scene_motion_score":float(scene_motion.get("score", 0.0) or 0.0),
+                               "ekran_merkez":(ecx,ecy),"offset":(ox,oy),
+                               "hwnd":hwnd,"client_cfg":cc, "client_idx": ci,
+                               "target_generation":frame_target_generation,
+                               "ts": frame_capture_ts}
+                guncel[pk] = self._publish_client_vision(pk, client_data)
 
                 # Debug frame
                 if cc.get("debug_on", True):
@@ -3208,21 +4720,34 @@ class VisionThread(threading.Thread):
                         hclr = (0,255,0) if hp_var else (0,0,255)
                         cv2.rectangle(vis,(x1h,y1h),(x2h,y2h),hclr,2)
                         cv2.putText(vis,f"HP:{hp_px}",(x1h,y1h-6),cv2.FONT_HERSHEY_SIMPLEX,0.4,hclr,1)
+                        if fill_box:
+                            fx1, fy1, fx2, fy2 = fill_box
+                            fclr = (0, 255, 255) if hp_fill is not None else (0, 140, 255)
+                            cv2.rectangle(vis, (fx1, fy1), (fx2, fy2), fclr, 2)
+                            ftxt = "CAN:--" if hp_fill is None else f"CAN:{hp_fill * 100:.1f}%"
+                            cv2.putText(vis, ftxt, (fx1, max(12, fy1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, fclr, 1)
+                        motion_text = "HAREKET" if scene_motion.get("moving") else "SABIT"
+                        cv2.putText(vis, f"{motion_text}:{scene_motion.get('score', 0.0):.2f}", (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 0), 1)
 
                         # KÃ¼Ã§Ã¼lt + JPEG encode (dÃ¼ÅŸÃ¼k kalite â€” hÄ±z iÃ§in)
                         try:
                             small = cv2.resize(vis, (640,360)) if img.shape[1] > 700 else vis
                             _,buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 30])
                             b64_frames[pk] = base64.b64encode(buf.tobytes()).decode()
+                            self._publish_debug_frame(pk, b64_frames[pk])
                             self._last_debug_encode[pk] = now
                         except: pass
 
-            # State gÃ¼ncelle (tek lock, hÄ±zlÄ±)
+            # Client sonuclari yukarida tek tek yayinlandi. Burada yalnizca o
+            # turda uretilemeyen/eski client verilerini temizle.
             with self.st.lk:
-                publish_ts = time.time()
-                for item in guncel.values():
-                    item["publish_ts"] = publish_ts
-                self.st.wdata = guncel
+                self.st.wdata.update(guncel)
+                stale_data_keys = [
+                    key for key in self.st.wdata
+                    if key not in active_keys or key not in guncel
+                ]
+                for key in stale_data_keys:
+                    del self.st.wdata[key]
                 # Inaktif client'larÄ±n frame'lerini temizle
                 stale_keys = [pk for pk in self.st.frame_b64 if pk not in active_keys]
                 for pk in stale_keys:
@@ -3244,8 +4769,9 @@ class VisionThread(threading.Thread):
 #  PyWebView API
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 class API:
-    def __init__(self, cfg, state):
+    def __init__(self, cfg, state, diagnostic_recorder=None):
         self.cfg, self.st = cfg, state
+        self._diagnostic_recorder = diagnostic_recorder
         self._vt = None; self._at = None
         self._toggle_lock = threading.Lock()
         self._toggle_busy_log_t = 0.0
@@ -3363,10 +4889,36 @@ class API:
         result['interception_ok'] = INTERCEPTION_OK
         return result
     def get_client(self, idx): return self.cfg.client(idx)
-    def save_client(self, idx, data): self.cfg.update_client(idx, data); return True
+    def save_client(self, idx, data):
+        try:
+            ci = int(idx)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Gecersiz istemci"}
+        if ci not in CLIENT_IDS:
+            return {"ok": False, "error": "Gecersiz istemci"}
+
+        incoming = dict(data or {})
+        proposed = self.cfg.client(ci)
+        proposed.update(incoming)
+        clients = {other_ci: self.cfg.client(other_ci) for other_ci in CLIENT_IDS}
+        error = validate_client_assignment(ci, proposed, clients)
+        if error:
+            return {"ok": False, "error": error}
+
+        self.cfg.update_client(ci, incoming)
+        return {"ok": True}
     def save_global(self, data):
         global _force_sendinput
-        self.cfg.update_global(data or {})
+        incoming = dict(data or {})
+        self.cfg.update_global(incoming)
+        if "diagnostic_video_enabled" in incoming and self._diagnostic_recorder is not None:
+            enabled = bool(incoming.get("diagnostic_video_enabled"))
+            self._diagnostic_recorder.set_enabled(enabled)
+            log_event(
+                self.st,
+                "info",
+                f"[VIDEO] otomatik tani kaydi {'acildi' if enabled else 'kapatildi'} (UI)",
+            )
         _force_sendinput = False
         return {"ok": True}
     def set_model(self, path): self.cfg.s(path, "model_yolu"); return True
@@ -3376,7 +4928,7 @@ class API:
         root=tk.Tk(); root.withdraw(); root.attributes('-topmost',True)
         p=filedialog.askopenfilename(filetypes=[("YOLO","*.pt")]); root.destroy()
         if p:
-            if idx in (1, 2):
+            if idx in CLIENT_IDS:
                 self.cfg.update_client(idx, {"model_yolu": p})
             else:
                 self.cfg.s(p,"model_yolu")
@@ -3389,6 +4941,146 @@ class API:
         threading.Thread(target=self._hp_sec, args=(client_idx,), daemon=True).start()
         return True
 
+    def select_hp_fill(self, client_idx):
+        threading.Thread(target=self._hp_fill_sec, args=(client_idx,), daemon=True).start()
+        return True
+
+    def select_rumeli2_captcha(self, client_idx):
+        """Secili istemci penceresini dondurup soru + 4 secenek alani toplar."""
+        try:
+            ci = int(client_idx)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Gecersiz istemci"}
+        if ci not in CLIENT_IDS:
+            return {"ok": False, "error": "Gecersiz istemci"}
+
+        cc = self.cfg.client(ci)
+        window_title = cc.get("pencere", "Yok")
+        if not window_title or window_title == "Yok":
+            return {"ok": False, "error": f"Once Istemciler sayfasindan Client {ci} penceresini sec"}
+
+        hwnd = hwnd_al(window_title)
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return {"ok": False, "error": f"Client {ci} penceresi bulunamadi; Istemciler sayfasindan yeniden sec"}
+
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+                time.sleep(0.15)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+                time.sleep(0.12)
+            except Exception:
+                pass
+
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width = int(right - left)
+            height = int(bottom - top)
+            if left <= -32000 or top <= -32000 or width <= 0 or height <= 0:
+                return {"ok": False, "error": f"Client {ci} penceresi yakalanamadi; pencereyi gorunur duruma getir"}
+            monitor = {"top": int(top), "left": int(left), "width": width, "height": height}
+            with mss.mss() as sct:
+                image = cv2.cvtColor(
+                    np.array(sct.grab(monitor), dtype=np.uint8),
+                    cv2.COLOR_BGRA2BGR,
+                )
+        except Exception as exc:
+            return {"ok": False, "error": f"Client {ci} penceresi yakalanamadi: {exc}"}
+        if image is None or image.size == 0:
+            return {"ok": False, "error": f"Client {ci} penceresinden goruntu alinamadi"}
+
+        steps = [
+            ("1/5 - YESIL SORU KODUNU SEC", (46, 204, 113)),
+            ("2/5 - 1. SECENEK KODUNU SEC", (246, 164, 59)),
+            ("3/5 - 2. SECENEK KODUNU SEC", (246, 164, 59)),
+            ("4/5 - 3. SECENEK KODUNU SEC", (246, 164, 59)),
+            ("5/5 - 4. SECENEK KODUNU SEC", (246, 164, 59)),
+        ]
+        selected = []
+        window_name = "RUMELI2 CAPTCHA Kalibrasyonu"
+        try:
+            for label, color in steps:
+                preview = image.copy()
+                for idx, (x, y, width, height) in enumerate(selected):
+                    previous_color = (46, 204, 113) if idx == 0 else (246, 164, 59)
+                    cv2.rectangle(preview, (x, y), (x + width, y + height), previous_color, 2)
+                cv2.rectangle(preview, (8, 8), (min(preview.shape[1] - 8, 430), 42), (8, 8, 8), -1)
+                cv2.putText(preview, label, (18, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2, cv2.LINE_AA)
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+                roi = cv2.selectROI(window_name, preview, showCrosshair=True, fromCenter=False)
+                cv2.destroyWindow(window_name)
+                x, y, width, height = [int(value) for value in roi]
+                if width <= 0 or height <= 0:
+                    return {"ok": False, "cancelled": True}
+                selected.append((x, y, width, height))
+        except Exception as exc:
+            try:
+                cv2.destroyWindow(window_name)
+            except Exception:
+                pass
+            return {"ok": False, "error": f"Alan secimi basarisiz: {exc}"}
+
+        height, width = image.shape[:2]
+
+        def _normalize(roi):
+            x, y, roi_w, roi_h = roi
+            return [
+                y / height,
+                (y + roi_h) / height,
+                x / width,
+                (x + roi_w) / width,
+            ]
+
+        question_region = _normalize(selected[0])
+        option_rois = sorted(selected[1:], key=lambda item: (item[1], item[0]))
+        option_regions = [_normalize(roi) for roi in option_rois]
+        shared_updates = shared_rumeli2_calibration_updates(
+            question_region,
+            option_regions,
+            [width, height],
+        )
+        self.cfg.update_clients(shared_updates)
+
+        annotated = image.copy()
+        cv2.rectangle(
+            annotated,
+            (selected[0][0], selected[0][1]),
+            (selected[0][0] + selected[0][2], selected[0][1] + selected[0][3]),
+            (46, 204, 113),
+            2,
+        )
+        for roi in option_rois:
+            x, y, roi_w, roi_h = roi
+            cv2.rectangle(annotated, (x, y), (x + roi_w, y + roi_h), (246, 164, 59), 2)
+        preview_path = os.path.join(RUMELI2_CALIBRATION_DIR, f"client_{ci}.png")
+        try:
+            raw_ok, raw_buffer = cv2.imencode(".png", image)
+            if raw_ok:
+                raw_buffer.tofile(os.path.join(RUMELI2_CALIBRATION_DIR, "shared.png"))
+            preview_ok, buffer = cv2.imencode(".png", annotated)
+            if preview_ok:
+                for client_id in CLIENT_IDS:
+                    buffer.tofile(os.path.join(RUMELI2_CALIBRATION_DIR, f"client_{client_id}.png"))
+        except Exception:
+            preview_path = ""
+
+        log_event(
+            self.st,
+            "info",
+            f"RUMELI2 CAPTCHA ortak kalibrasyonu Client {ci} penceresinden Client 1/2/3 icin kaydedildi: 1 soru + 4 secenek",
+        )
+        return {
+            "ok": True,
+            "client": ci,
+            "clients": list(CLIENT_IDS),
+            "shared": True,
+            "question_region": question_region,
+            "option_regions": option_regions,
+            "calibration_size": [width, height],
+            "preview_path": preview_path,
+        }
+
     def _hp_sec(self, ci):
         cc = self.cfg.client(ci)
         hwnd = hwnd_al(cc.get("pencere","Yok"))
@@ -3400,26 +5092,127 @@ class API:
                     if r[0]>=-32000: m={"top":r[1],"left":r[0],"width":r[2]-r[0],"height":r[3]-r[1]}
                 except: pass
             img = cv2.cvtColor(np.array(sct.grab(m),dtype=np.uint8), cv2.COLOR_BGRA2BGR)
-            cv2.namedWindow("HP Bar Sec", cv2.WINDOW_NORMAL)
-            cv2.setWindowProperty("HP Bar Sec", cv2.WND_PROP_TOPMOST, 1)
-            roi = cv2.selectROI("HP Bar Sec", img, showCrosshair=True, fromCenter=False)
-            cv2.destroyWindow("HP Bar Sec")
+            window_name = "HP Panelinin Tamamini Sec (Can %100 iken)"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+            roi = cv2.selectROI(window_name, img, showCrosshair=True, fromCenter=False)
+            cv2.destroyWindow(window_name)
             if roi[2]>0 and roi[3]>0:
                 h,w = img.shape[:2]
-                # HP region config kaydet
-                self.cfg.update_client(ci, {
-                    "hp_region":[roi[1]/h,(roi[1]+roi[3])/h,roi[0]/w,(roi[0]+roi[2])/w],
-                    "hp_region_custom": True
-                })
-                # Template image kaydet
                 roi_img = img[roi[1]:roi[1]+roi[3], roi[0]:roi[0]+roi[2]]
-                tpl_path = os.path.join(HP_TEMPLATE_DIR, f"client_{ci}.png")
-                cv2.imwrite(tpl_path, roi_img)
-                log_event(self.st, "info", f"Client {ci} HP template kaydedildi: {roi[2]}x{roi[3]}")
-                # VisionThread'e template'i yeniden yÃ¼kle
+                bar_result = locate_hp_bar(roi_img)
+                if not bar_result.get("found") or not bar_result.get("bar_box"):
+                    log_event(
+                        self.st,
+                        "error",
+                        f"Client {ci} HP panel secimi kaydedilmedi: kirmizi can cubugu bulunamadi; paneli can %100 iken tam secin",
+                    )
+                    return
+
+                bx, by, bw, bh = bar_result["bar_box"]
+                panel_w, panel_h = int(roi[2]), int(roi[3])
+                hp_region = [
+                    roi[1]/h, (roi[1]+panel_h)/h,
+                    roi[0]/w, (roi[0]+panel_w)/w,
+                ]
+                hp_auto_bar_region = [
+                    by/panel_h, (by+bh)/panel_h,
+                    bx/panel_w, (bx+bw)/panel_w,
+                ]
+                hp_fill_region = [
+                    (roi[1]+by)/h, (roi[1]+by+bh)/h,
+                    (roi[0]+bx)/w, (roi[0]+bx+bw)/w,
+                ]
+                calibration_update = {
+                    "hp_region": hp_region,
+                    "hp_region_custom": True,
+                    "hp_panel_auto": True,
+                    "hp_auto_bar_region": hp_auto_bar_region,
+                    "hp_panel_calibration_size": [w, h],
+                    "hp_fill_region": hp_fill_region,
+                    "hp_fill_region_custom": True,
+                }
+
+                # Ayni cozunurlukteki Rumeli2 pencerelerinde panel koordinatlari
+                # aynidir. Secimi yalnizca gercek pencere boyutu birebir ayni
+                # client'larla paylas; farkli cozunurluge asla kopyalama.
+                shared_clients = []
+                for target_ci in CLIENT_IDS:
+                    target_cfg = self.cfg.client(target_ci)
+                    target_hwnd = hwnd_al(target_cfg.get("pencere", "Yok"))
+                    if target_ci == ci:
+                        shared_clients.append(target_ci)
+                        continue
+                    if not target_hwnd or not win32gui.IsWindow(target_hwnd):
+                        continue
+                    try:
+                        tr = win32gui.GetWindowRect(target_hwnd)
+                        target_size = (int(tr[2] - tr[0]), int(tr[3] - tr[1]))
+                    except Exception:
+                        continue
+                    if target_size == (w, h):
+                        shared_clients.append(target_ci)
+
+                self.cfg.update_clients({
+                    target_ci: dict(calibration_update)
+                    for target_ci in shared_clients
+                })
+                for target_ci in shared_clients:
+                    tpl_path = os.path.join(HP_TEMPLATE_DIR, f"client_{target_ci}.png")
+                    cv2.imwrite(tpl_path, roi_img)
+                log_event(
+                    self.st,
+                    "info",
+                    f"Client {ci} tam HP paneli kaydedildi: {panel_w}x{panel_h}; "
+                    f"can cubugu otomatik bulundu: {bw}x{bh}; ayni boyuttaki client'lar="
+                    f"{','.join(str(value) for value in shared_clients)}",
+                )
                 if self._vt is not None:
-                    self._vt._hp_template_cache.clear()
                     self._vt._load_hp_templates()
+                    for target_ci in shared_clients:
+                        target_window = self.cfg.client(target_ci).get("pencere", "Yok")
+                        self._vt._hp_presence_hist.pop(target_window, None)
+                        self._vt._hp_fill_hist.pop(target_window, None)
+                        self._vt._hp_accepted_floor.pop(target_window, None)
+
+    def _hp_fill_sec(self, ci):
+        cc = self.cfg.client(ci)
+        hwnd = hwnd_al(cc.get("pencere", "Yok"))
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            if hwnd:
+                try:
+                    rect = win32gui.GetWindowRect(hwnd)
+                    if rect[0] >= -32000:
+                        monitor = {
+                            "top": rect[1], "left": rect[0],
+                            "width": rect[2] - rect[0], "height": rect[3] - rect[1],
+                        }
+                except Exception:
+                    pass
+            image = cv2.cvtColor(np.array(sct.grab(monitor), dtype=np.uint8), cv2.COLOR_BGRA2BGR)
+            window_name = "Can Cubugu Sec"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+            roi = cv2.selectROI(window_name, image, showCrosshair=True, fromCenter=False)
+            cv2.destroyWindow(window_name)
+            if roi[2] <= 0 or roi[3] <= 0:
+                return
+            height, width = image.shape[:2]
+            self.cfg.update_client(ci, {
+                "hp_fill_region": [
+                    roi[1] / height,
+                    (roi[1] + roi[3]) / height,
+                    roi[0] / width,
+                    (roi[0] + roi[2]) / width,
+                ],
+                "hp_fill_region_custom": True,
+            })
+            if self._vt is not None:
+                target_window = cc.get("pencere", "Yok")
+                self._vt._hp_fill_hist.pop(target_window, None)
+                self._vt._hp_accepted_floor.pop(target_window, None)
+            log_event(self.st, "info", f"Client {ci} can cubugu alani kaydedildi: {roi[2]}x{roi[3]}")
 
     def get_status(self):
         self._poll_terminal_files()
@@ -3446,17 +5239,27 @@ class API:
             kill_counts = dict(self.st.kill_counts)
         with self._terminal_lock:
             terminal_logs = list(self._terminal_logs)
-        result = {"aktif":aktif, "started_at":started_at, "cihaz":cihaz, "vision_fps": 0.0, "logs": logs + terminal_logs, "global_pause": global_pause, "checklist": {"clients": {}}, "clients":{}}
-        for ci in [1, 2]:
-            cc = self.cfg.client(ci)
+        video_status = (
+            self._diagnostic_recorder.status()
+            if self._diagnostic_recorder is not None
+            else {"enabled": False, "recording": False}
+        )
+        result = {"aktif":aktif, "started_at":started_at, "cihaz":cihaz, "vision_fps": 0.0, "logs": logs + terminal_logs, "global_pause": global_pause, "diagnostic_video": video_status, "checklist": {"clients": {}}, "clients":{}}
+        client_configs = {ci: self.cfg.client(ci) for ci in CLIENT_IDS}
+        duplicate_clients = duplicate_client_ids(client_configs)
+        for ci in CLIENT_IDS:
+            cc = client_configs[ci]
             pk = cc.get("pencere", "Yok")
             client_kill_key = f"c{ci}"
             kill_count = kill_counts.get(client_kill_key)
             if kill_count is None:
                 kill_count = kill_counts.get(pk, 0)
             client_aktif = cc.get("aktif", True)
-            hp_ready = bool(cc.get("hp_region_custom")) or bool(cc.get("hp_region"))
-            window_ready = client_aktif and pk != "Yok"
+            hp_ready = bool(cc.get("hp_region_custom") and cc.get("hp_region"))
+            hp_fill_ready = bool(cc.get("hp_fill_region_custom") and cc.get("hp_fill_region"))
+            hp_panel_auto = bool(cc.get("hp_panel_auto") and cc.get("hp_auto_bar_region"))
+            duplicate_window = ci in duplicate_clients
+            window_ready = client_aktif and pk != "Yok" and not duplicate_window
             model_ready = bool(cc.get("model_yolu") or self.cfg.g("model_yolu"))
             
             result["checklist"]["clients"][str(ci)] = {
@@ -3469,7 +5272,11 @@ class API:
             
             # Daha dÃ¼zenli bir return objesi
             cd = {
-                "durum": "PASIF" if not client_aktif else (durum.get(pk, "BEKLIYOR") if live_seen else "BEKLIYOR"),
+                "durum": (
+                    "PASIF" if not client_aktif else
+                    "PENCERE CAKISMASI" if duplicate_window else
+                    (durum.get(pk, "BEKLIYOR") if live_seen else "BEKLIYOR")
+                ),
                 "hp_var": False,
                 "hedef": 0,
                 "frame": "",
@@ -3478,6 +5285,9 @@ class API:
                 "hp_px": 0,
                 "captcha": (captcha_state.get(pk, False) if live_seen else False),
                 "hp_template": hp_ready,
+                "hp_panel_auto": hp_panel_auto,
+                "hp_fill_ready": hp_fill_ready,
+                "hp_fill": None,
                 "hp_template_score": 1.0 if hp_ready else 0.0,
                 "kill_count": kill_count
             }
@@ -3489,6 +5299,7 @@ class API:
                 cd["hp_var"] = d.get("hp_var",False)
                 cd["hedef"] = len(d.get("merkezler",[]))
                 cd["hp_px"] = d.get("hp_piksel",0)
+                cd["hp_fill"] = d.get("hp_fill")
             if pk in b64 and aktif:
                 cd["frame"] = b64[pk]  # pre-encoded, anÄ±nda dÃ¶ner
             result["clients"][str(ci)] = cd
@@ -3568,9 +5379,18 @@ class API:
         return True
 
 def main():
+    print("[STARTUP] Uygulama ana baslangicina girdi.", flush=True)
     _cleanup_runtime_dir(LOG_DIR, LOG_RETENTION_DAYS, keep_suffixes=(".jsonl",))
     _cleanup_runtime_dir(EVIDENCE_DIR, EVIDENCE_RETENTION_DAYS, keep_suffixes=(".png", ".json"))
-    cfg = Cfg(); state = State(); api = API(cfg, state)
+    cfg = Cfg(); state = State()
+    diagnostic_recorder = DiagnosticVideoRecorder(
+        DIAGNOSTIC_VIDEO_DIR,
+        context_provider=lambda: _diagnostic_video_context(cfg, state),
+        log_callback=lambda level, message: log_event(state, level, message),
+        enabled=cfg.g("diagnostic_video_enabled") is not False,
+    )
+    api = API(cfg, state, diagnostic_recorder=diagnostic_recorder)
+    diagnostic_recorder.start()
     # F5 hotkey - key-up olayÄ±na baÄŸlÄ± kalmadan debounce ile Ã§alÄ±ÅŸÄ±r.
     _f5_last_t = 0.0
     _f5_lock = threading.Lock()
@@ -3605,9 +5425,21 @@ def main():
     threading.Thread(target=_f5_poll_loop, daemon=True).start()
     # SHIFT+SOL TIK iÃ§in hotkey (normal tÄ±klamayÄ± engelle, bot tÄ±klamasÄ±nÄ± kullan)
     keyboard.add_hotkey('shift+left', sol_tik_hw_shift_callback, suppress=True)
-    window = webview.create_window(title="PHANTOM", url=HTML_FILE, js_api=api,
-                                    width=760, height=500, resizable=False)
-    webview.start(debug=False)
+    print("[STARTUP] WebView penceresi tanimlaniyor.", flush=True)
+    window = webview.create_window(
+        title="PHANTOM",
+        url=HTML_FILE,
+        js_api=api,
+        width=1120,
+        height=620,
+        resizable=True,
+    )
+    print("[STARTUP] WebView olay dongusu baslatiliyor.", flush=True)
+    try:
+        webview.start(debug=False)
+    finally:
+        diagnostic_recorder.stop()
+        diagnostic_recorder.join(timeout=3.0)
 
 if __name__ == '__main__':
     main()

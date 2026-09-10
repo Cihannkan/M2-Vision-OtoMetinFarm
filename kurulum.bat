@@ -13,8 +13,8 @@ set "PIP_INSTALL_OPTS=--timeout 60 --retries 5"
 set "PIP_UPGRADE_OPTS=--upgrade --timeout 60 --retries 5"
 set "PIP_TOOLS_CHECK=import importlib.util, pip; raise SystemExit(0 if importlib.util.find_spec('setuptools') and importlib.util.find_spec('wheel') else 1)"
 set "TORCH_CHECK=import torch, torchvision, torchaudio"
-set "PROJECT_DEPS_CHECK=import certifi, cv2, easyocr, keyboard, mss, numpy, webview, win32api, win32gui; from ultralytics import YOLO"
-set "FULL_DEPS_CHECK=import certifi, cv2, easyocr, keyboard, mss, numpy, torch, webview, win32api, win32gui; from ultralytics import YOLO; from src.phantom.app.main import main; print('PHANTOM dependency check OK')"
+set "PROJECT_DEPS_CHECK=import certifi, cv2, easyocr, keyboard, mss, numpy, onnx, onnxruntime, webview, win32api, win32gui; from ultralytics import YOLO"
+set "FULL_DEPS_CHECK=import certifi, cv2, easyocr, keyboard, mss, numpy, onnx, onnxruntime, torch, webview, win32api, win32gui; from ultralytics import YOLO; from src.phantom.app.main import main; print('PHANTOM dependency check OK')"
 set "EASYOCR_CACHE_CHECK=from src.phantom.captcha.solver import _easyocr_models_ready; raise SystemExit(0 if _easyocr_models_ready() else 1)"
 set "AUTO_MODE=0"
 if /i "%~1"=="/auto" set "AUTO_MODE=1"
@@ -80,7 +80,7 @@ echo.
 call :check_import "%PROJECT_DEPS_CHECK%"
 if errorlevel 1 (
     echo [INFO] Eksik proje kutuphaneleri kuruluyor...
-    call :run "%VENV_PY%" -m pip install %PIP_INSTALL_OPTS% certifi numpy opencv-python mss keyboard pywin32 pywebview easyocr ultralytics
+    call :run "%VENV_PY%" -m pip install %PIP_INSTALL_OPTS% certifi numpy opencv-python mss keyboard pywin32 pywebview easyocr ultralytics onnx onnxruntime-directml
     if errorlevel 1 goto fail
 ) else (
     echo [OK] Proje kutuphaneleri zaten hazir.

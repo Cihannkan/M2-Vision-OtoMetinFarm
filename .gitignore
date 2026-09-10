@@ -16,6 +16,7 @@ runtime/easyocr_models/
 # User-specific HP selections
 templates/hp_templates/*
 !templates/hp_templates/.gitkeep
+templates/rumeli2_captcha/*
 
 # User-specific config (generated at first run)
 config_phantom.json

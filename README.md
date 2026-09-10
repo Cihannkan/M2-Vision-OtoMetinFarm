@@ -37,9 +37,12 @@
 
 ## Kısa Özet
 
-PHANTOM Bot, iki ayrı oyun istemcisini aynı panelden yönetmek için tasarlanmış bir otomasyon aracıdır. Her client için ayrı model, pencere, HP paneli ve canlı debug görüntüsü tutulur. Bot, ekrandaki hedefleri YOLO modeli ile algılar, HP durumuna göre savaş akışını takip eder, hedef öldüğünde loot toplar ve istatistikleri arayüzde gösterir.
+PHANTOM Bot, en fazla üç ayrı oyun istemcisini aynı panelden yönetmek için tasarlanmış bir otomasyon aracıdır. Her client için ayrı model, pencere, HP paneli ve canlı debug görüntüsü tutulur. Bot, ekrandaki hedefleri YOLO modeli ile algılar, HP durumuna göre savaş akışını takip eder, hedef öldüğünde loot toplar ve istatistikleri arayüzde gösterir.
 
 Projenin hedefi, başka bir Windows bilgisayarda da minimum manuel işlemle çalışmaktır. Bu yüzden kurulum akışı `.venv` tabanlıdır; sistem Python ortamını kirletmez, eksik Python sürümünü indirir, gerekli paketleri kurar ve sonunda gerçek import testi yapar.
+
+Bilinen davranışlar, kanıtlar ve canlı kabul ölçütleri tek yerde
+[`docs/PHANTOM_CASES.md`](docs/PHANTOM_CASES.md) dosyasında izlenir.
 
 ---
 
@@ -56,7 +59,7 @@ Projenin hedefi, başka bir Windows bilgisayarda da minimum manuel işlemle çal
 | Özellik | Neden önemli? | Ne zaman kullanılmalı? |
 | --- | --- | --- |
 | Hedef Kuyruğu | Bir hedefte HP varken sıradaki hedefi hazırlayarak bekleme süresini azaltır. | Yoğun hedef bulunan alanlarda en verimli moddur. |
-| HP Panel Seçimi | Botun savaşta mı, aramada mı olduğunu anlamasının ana sinyalidir. | İlk kurulumdan sonra her client için mutlaka seçilmelidir. |
+| HP Panel Seçimi | Tam panelden sabit çerçeveyi ve kırmızı can çubuğunu otomatik çıkarır. | İlk kurulumdan sonra her client için, hedef canı %100 iken seçilmelidir. |
 | Canlı Debug Görüntüsü | Modelin ne gördüğünü, HP kutusunu ve hedef merkezini anında gösterir. | Yanlış tıklama, model görmeme veya HP algılama sorunlarında ilk bakılacak yerdir. |
 | Interception / SendInput Katmanı | Girdi gönderimini otomatik olarak uygun yöntemle yapar. | Interception kullanılabiliyorsa daha düşük seviyeli input yolu devreye girer; yoksa SendInput ile çalışmaya devam eder. |
 | Mesaj Koruması | Mesaj penceresi veya bildirim algılanınca kısa süre işlem önceliğini mesaja verip cevap göndermeye çalışır. | Uzun süreli kullanımda beklenmeyen mesaj pencereleri için faydalıdır. |
@@ -67,9 +70,9 @@ Projenin hedefi, başka bir Windows bilgisayarda da minimum manuel işlemle çal
 
 ## Özellikler
 
-### Çift Client Yönetimi
+### Üç Client Yönetimi
 
-- `Client 1` ve `Client 2` ayrı ayrı açılıp kapatılabilir.
+- `Client 1`, `Client 2` ve `Client 3` ayrı ayrı açılıp kapatılabilir.
 - Her client için ayrı oyun penceresi seçilir.
 - Her client için model dosyası seçilebilir.
 - Her client için HP panel alanı ayrı kaydedilir.
@@ -82,21 +85,23 @@ Projenin hedefi, başka bir Windows bilgisayarda da minimum manuel işlemle çal
 - Kararlı hedef filtresi, hedefin iki karede benzer konumda kalmasını bekler.
 - Merkez yakınındaki hedefleri filtrelemek için `ignore_radius` kullanılır.
 - `conf_esik` sabit olarak `0.50` uygulanır.
-- Model inference GPU varsa CUDA üzerinde, yoksa CPU üzerinde çalışır.
+- NVIDIA CUDA varsa model inference CUDA üzerinde çalışır.
+- CUDA yoksa ve modelin yanında güncel bir `.onnx` dosyası varsa ONNX Runtime DirectML ile AMD/Intel/NVIDIA DirectX 12 GPU kullanılır.
+- GPU yolu başlatılamaz veya inference sırasında hata verirse bot otomatik olarak mevcut CPU yoluna döner.
 
 ### HP Takibi
 
-- Kullanıcı her client için HP bar bölgesini seçer.
-- Seçilen HP alanı template olarak `templates/hp_templates/` altında saklanır.
-- Bot savaş durumunu HP görünürlüğüne göre takip eder.
-- HP kaybolduğunda hedefin öldüğü kabul edilir ve kill istatistiği artar.
+- Kullanıcı her client için hedef HP panelinin tamamını tek seferde seçer.
+- Bot kırmızı can çubuğunu otomatik bulur; ayrıca bir can alanı seçmek gerekmez.
+- Sabit panel çerçevesi konum toleranslı aranır ve görünürlük üç karenin ikisiyle doğrulanır.
+- Canın gerçekten azalması saldırının başladığını doğrular. Panel yalnız son güvenilir can `%6` veya altındayken ve en az üç taze karede kayıpsa hedefin öldüğü kabul edilir; daha yüksek canda hedef korunur.
 
 ### Hedef Kuyruğu
 
 Hedef Kuyruğu, özellikle seri hedef kesme akışında en yararlı otomasyon modlarından biridir.
 
 - İlk hedefe tıklandıktan sonra HP görünürken sıradaki hedef hazırlanır.
-- HP kaybolunca kill sayacı artar ve bot tekrar hedef aramaya döner.
+- Güvenilir düşük can sonrası HP paneli kaybolunca kill sayacı artar ve bot tekrar hedef aramaya döner.
 - Hedef kuyruğu açıkken bot taze frame kontrolü yapar; eski görüntüye göre tıklamayı engeller.
 - Hedefler blacklist mantığıyla tekrar tekrar aynı noktaya basmayacak şekilde filtrelenir.
 
@@ -104,11 +109,23 @@ Hedef Kuyruğu, özellikle seri hedef kesme akışında en yararlı otomasyon mo
 
 - Hedef öldükten sonra `Z` tuşu ile loot toplama tetiklenir.
 - Loot burst davranışı kısa aralıklarla birden fazla basış yapabilir.
+
+### Otomatik Tanı Videosu
+
+- PHANTOM açıldığında varsayılan olarak tüm masaüstünü 2 FPS hızında ve ses
+  olmadan kaydeder.
+- Kayıtlar beş dakikalık parçalara ayrılır ve
+  `runtime/evidence/videos/` altında tutulur.
+- Her videonun aynı adlı `.jsonl` dosyasında kare zamanı, foreground pencere,
+  fare konumu, client HWND/konumu, bot durumu, hedef nesli ve HP ölçümü yer alır.
+- İki günden eski veya toplam 2 GB sınırını aşan yalnızca PHANTOM tanı kayıtları
+  otomatik temizlenir.
+- Kayıt `Ayarlar > Güvenlik > Tanı Videosu` anahtarından kapatılabilir.
 - Oto Loot ayarı `Ayarlar > Otomasyon` bölümünden açılıp kapatılır.
 
 ### Anti-Stuck / Kurtarma
 
-- Arama, savaş ve kuyruk durumlarında takılma belirtileri izlenir.
+- Arama ve savaş durumlarında takılma belirtileri izlenir.
 - Belirli süre hedef bulunmazsa veya savaş uzarsa kurtarma manevrası uygulanır.
 - Geri ve yan hareket kombinasyonları ile karakterin sıkıştığı yerden çıkması hedeflenir.
 - Varsayılan sabitler:
@@ -131,6 +148,7 @@ CAPTCHA varsayılan olarak kapalı gelir. Gerektiğinde `Ayarlar > Güvenlik > C
 - `Origins Çözümleyici`: Origins matematik CAPTCHA akışına odaklanır.
 - `Helios Algoritması`: Görsel seçim / hedef kelime benzeri tipler için kullanılır.
 - `Merlis Motoru`: Bütünlüğü bozan veya farklı kare mantığındaki tipler için kullanılır.
+- `RUMELİ2 Eşleştirici`: Kalibre edilen yeşil soru kodunu dört seçenekle OCR ve rakam şekli üzerinden karşılaştırır.
 
 CAPTCHA sistemi EasyOCR kullanır. OCR ilk açılışta model dosyalarını indirebileceği için ilk kullanımda hazır olması biraz zaman alabilir.
 
@@ -175,6 +193,7 @@ Kurulum scripti şunları yapar:
    - `pywin32`
    - `pywebview`
    - `easyocr`
+   - `onnx`, `onnxruntime-directml`
 8. Microsoft WebView2 Runtime kurulumunu dener.
 9. Son adımda gerçek import testi yapar.
 
@@ -191,7 +210,7 @@ runtime/logs/kurulum_YYYYMMDD_HHMMSS.log
 | İşletim sistemi | Windows 10 veya Windows 11, 64-bit |
 | Python | Kurulum scripti Python 3.11.9 kurabilir |
 | İnternet | İlk kurulumda Python, Torch, EasyOCR ve paketler için gerekli |
-| GPU | Opsiyonel; NVIDIA GPU varsa CUDA Torch denenir |
+| GPU | Opsiyonel; NVIDIA için CUDA, DirectX 12 kartlar için ONNX Runtime DirectML kullanılabilir |
 | WebView2 | Kurulum scripti kurmayı dener; çoğu Windows 10/11 sistemde zaten yüklüdür |
 | Yetki | Bot başlatıcı yönetici izni ister |
 
@@ -227,7 +246,7 @@ Kısayol:
 
 ## İlk Kullanım Akışı
 
-Bu bölüm kurulum bittikten sonra botun ilk kez nasıl hazırlanacağını anlatır. İlk denemede yalnızca `Client 1` ile başlayın; her şey doğru çalıştıktan sonra aynı adımları `Client 2` için de uygulayın.
+Bu bölüm kurulum bittikten sonra botun ilk kez nasıl hazırlanacağını anlatır. İlk denemede yalnızca `Client 1` ile başlayın; her şey doğru çalıştıktan sonra aynı adımları `Client 2` ve `Client 3` için de uygulayın.
 
 ### 1. Oyunu ve Botu Açın
 
@@ -254,7 +273,7 @@ Yanlış model seçilirse bot hedefi hiç göremeyebilir veya yanlış yerlere t
 
 1. `Pencere` açılır listesinden otomasyon yapılacak Metin2 client penceresini seçin.
 2. Pencere listede yoksa oyun açık ve görünür durumdayken `Pencere` satırındaki yenile düğmesine basın.
-3. İki client kullanıyorsanız `Client 1` ve `Client 2` için farklı oyun pencereleri seçin. İki panelde aynı pencere seçilirse bot iki client'ı aynı ekran sanır.
+3. Birden fazla client kullanıyorsanız her biri için farklı oyun penceresi seçin. Arayüz aynı pencerenin iki aktif Client alanına atanmasını engeller.
 
 ### 4. HP Panel Alanını Seçin
 
@@ -262,13 +281,13 @@ HP Panel seçimi botun savaşta olup olmadığını anlaması için kritik adım
 
 1. Oyunda bir metne veya hedefe bir kez tıklayın, üst tarafta hedef adı ve HP barı görünsün.
 2. Bot arayüzünde ilgili client için `HP Panel` düğmesine basın.
-3. `HP Bar Sec` adlı seçim penceresi açılır.
-4. Fareyle yalnızca üst tarafta görünen hedef/metin HP barını çerçeve içine alın.
-5. Seçime metin adını, ikonları, boş alanları, karakter HP/MP barını veya oyun arayüzünün başka parçalarını dahil etmeyin.
-6. Çerçeveyi mümkün olduğunca dar tutun; sadece HP barın dolu/kırmızı bölümünü ve sabit bar alanını kapsaması en sağlıklı sonuç verir.
+3. `HP Panelinin Tamamini Sec (Can %100 iken)` adlı seçim penceresi açılır.
+4. Fareyle hedef adı, yüzde, kırmızı çubuk, çerçeve ve X düğmesi dahil olmak üzere panelin tamamını sıkıca çerçeve içine alın.
+5. Panel dışındaki oyun dünyasını, karakterin kendi HP/MP barını veya başka arayüz parçalarını dahil etmeyin.
+6. Bot kırmızı can çubuğunu otomatik çıkarır; ikinci bir alan seçimi yapılmaz.
 7. Seçimi onaylamak için `Enter` veya `Space` tuşuna basın. Yanlış seçtiyseniz `Esc` ile iptal edip `HP Panel` düğmesine tekrar basın.
 
-Seçim tamamlanınca bot bu görüntüyü `templates/hp_templates/client_1.png` veya `client_2.png` olarak kaydeder. Oyun çözünürlüğünü, pencere boyutunu, arayüz ölçeğini veya server/client görünümünü değiştirirseniz HP panelini yeniden seçin.
+Seçim tamamlanınca bot bu görüntüyü `templates/hp_templates/client_1.png`, `client_2.png` veya `client_3.png` olarak kaydeder. Oyun çözünürlüğünü, pencere boyutunu, arayüz ölçeğini veya server/client görünümünü değiştirirseniz HP panelini yeniden seçin.
 
 ### 5. Ayarları Kontrol Edin
 
@@ -295,7 +314,7 @@ Seçim tamamlanınca bot bu görüntüyü `templates/hp_templates/client_1.png` 
 | --- | --- |
 | Model | Client için kullanılacak `.pt` YOLO modelini seçer. |
 | Pencere | Otomasyon yapılacak oyun penceresini seçer. |
-| HP Panel | Hedefe/metne tıklayınca üstte çıkan hedef HP barını seçmek için ekran üzerinden ROI seçimi açar. Karakterin kendi HP/MP barı seçilmemelidir. |
+| HP Panel | Hedefe/metne tıklayınca üstte çıkan panelin tamamını seçmek için ekran üzerinden ROI seçimi açar. Kırmızı can alanı otomatik bulunur. |
 | Canlı Görüntü | Debug feed üzerinde model çıktısını, merkez çizgisini ve HP alanını gösterir. |
 | Debug | Görüntü encode ve arayüz feed maliyetini açar/kapatır. |
 | C1/C2 ON-OFF | Client’ın aktif olup olmayacağını belirler. |
@@ -389,6 +408,7 @@ CAPTCHA sistemi `src/phantom/captcha/solver.py` içinde yer alır ve `CaptchaWat
 | --- | --- |
 | `templates/captcha_template/captcha_template.png` | CAPTCHA dialog doğrulama ve template scan için kullanılır. |
 | `templates/captcha_keypad/captcha_keypad.png` | Sayısal keypad / görsel doğrulama akışlarında referans olarak kullanılır. |
+| `templates/rumeli2_captcha/client_N.png` | RUMELİ2 kalibrasyonunda seçilen bölgeleri gösteren teşhis önizlemesidir. |
 | `runtime/captcha_kontrol/` | Çözüm öncesi veya teşhis amaçlı CAPTCHA görüntülerinin kaydedildiği klasördür. |
 
 ### CAPTCHA Tipleri
@@ -399,6 +419,9 @@ CAPTCHA sistemi `src/phantom/captcha/solver.py` içinde yer alır ve `CaptchaWat
 | Origins Çözümleyici | `captcha_tip4=true` | Matematik / toplam sonucu isteyen Origins tipi dialoglar için kullanılır. |
 | Helios Algoritması | `captcha_tip1=true` | Görsel veya hedef kelime seçimi mantığındaki tipler için kullanılır. |
 | Merlis Motoru | `captcha_tip2=true` | Farklı kare veya bütünlüğü bozan kare seçimi mantığındaki tipler için kullanılır. |
+| RUMELİ2 Eşleştirici | `captcha_rumeli2=true` | Kullanıcının işaretlediği soru ve dört seçenek alanını iki karede doğrular; OCR ile şekil eşleşmesi uzlaşırsa tek tık gönderir. |
+
+RUMELİ2 ilk kullanımında `Ayarlar > Güvenlik` bölümünden CAPTCHA'nın göründüğü herhangi bir client seçilir. Yeşil soru kodu ve dört seçenek kodu sırayla işaretlenir. Bölgeler pencere boyutuna oranlı saklanır ve Client 1, 2 ve 3'e ortak uygulanır. Bunun için üç oyun penceresinin çözünürlüğü ile oyun arayüz ölçeği aynı olmalıdır. CAPTCHA var/yok kararı yeşil renge göre değil; panelin sabit üst yazısı, çerçevesi ve taş dokusunun ortak referansla birkaç ardışık karede eşleşmesine göre verilir. Referans doğrulanmadan OCR veya tıklama çalışmaz. Eşleşme belirsizse solver tıklamaz ve farm CAPTCHA bekleme durumunda kalır.
 
 ### Mesaj Koruması Nasıl Çalışır?
 
@@ -473,8 +496,6 @@ PHANTOM_BOT/
 │     ├─ app/
 │     ├─ captcha/
 │     ├─ automation/
-│     ├─ core/
-│     ├─ input/
 │     └─ vision/
 └─ docs/
    └─ screenshots/
@@ -595,6 +616,10 @@ Torch büyük bir pakettir. CUDA sürümü indiriliyorsa dosya boyutu daha yüks
 
 Kurulum scripti CUDA Torch başarısız olursa CPU Torch’a düşer. Bot yine çalışır, ancak model inference daha yavaş olabilir. NVIDIA sürücüsünü güncellemek performans için faydalı olabilir.
 
+### AMD / DirectML hızlandırması
+
+Seçilen `model.pt` dosyasının yanında aynı adda güncel bir `model.onnx` bulunursa PHANTOM, CUDA olmayan Windows sistemlerinde önce DirectML'i dener. Örneğin `models/best.pt` için hızlandırılmış dosya `models/best.onnx` olmalıdır. DirectML kullanılamazsa veya ONNX dosyası eskiyse bot hata vermeden CPU modeline döner. Terminalde `Model cihazi: AMD DirectML` veya geri dönüş nedenini gösteren bir kayıt bulunur.
+
 ### Pencere listesinde oyun görünmüyor
 
 - Oyunun açık olduğundan emin olun.
@@ -612,10 +637,10 @@ Kurulum scripti CUDA Torch başarısız olursa CPU Torch’a düşer. Bot yine �
 
 ### HP algılanmıyor
 
-- HP paneli yeniden seçin.
-- HP bar seçimini mümkün olduğunca dar ve sabit alana yapın.
+- Hedef canı %100 iken HP panelini yeniden seçin.
+- Hedef adı, kırmızı çubuk, dış çerçeve ve X düğmesi dahil panelin tamamını sıkıca alın.
 - Farklı çözünürlük veya UI ölçeği kullanıyorsanız HP template’i yeniden oluşturun.
-- Debug görüntüsünde HP kutusunun doğru yerde olduğundan emin olun.
+- Debug görüntüsünde HP paneli ve otomatik can kutusunun doğru yerde olduğundan emin olun.
 
 ### Bot hedefe tıklamıyor
 
@@ -681,7 +706,7 @@ Botun temel durumları şunlardır:
 ARANIYOR -> DOGRULAMA -> SAVASIYOR -> ARANIYOR
 ```
 
-Hedef kuyruğu açıkken akış `KUYRUK` durumunu da kullanır. CAPTCHA veya mesaj sırasında global pause devreye girer:
+CAPTCHA veya mesaj sırasında global pause devreye girer:
 
 ```text
 CAPTCHA / CAPTCHA BEKLE

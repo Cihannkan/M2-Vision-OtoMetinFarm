@@ -2,110 +2,72 @@
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
-net session >nul 2>&1
-if %errorLevel% neq 0 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-    exit /b
+if not exist "runtime\logs" mkdir "runtime\logs" >nul 2>&1
+set "LAUNCH_LOG=%~dp0runtime\logs\launcher_latest.log"
+if /i not "%~1"=="/elevated" >> "%LAUNCH_LOG%" echo.
+call :launcher_log "Baslatma istendi. Parametre=%~1"
+
+rem net session, Server hizmetine de bagli oldugu icin guvenilir bir yonetici testi degildir.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$id=[Security.Principal.WindowsIdentity]::GetCurrent(); $principal=New-Object Security.Principal.WindowsPrincipal($id); if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){exit 0}else{exit 1}" >nul 2>&1
+if not errorlevel 1 goto elevated_ready
+
+if /i "%~1"=="/elevated" (
+    call :launcher_log "HATA: Yukseltilmis baslatma yapildi ancak yonetici yetkisi alinamadi."
+    call :show_error "PHANTOM yonetici yetkisi alamadi. launcher_latest.log dosyasini kontrol edin."
+    exit /b 1
 )
+
+call :launcher_log "Windows yonetici izni isteniyor."
+set "PHANTOM_BAT_PATH=%~f0"
+set "PHANTOM_BAT_DIR=%~dp0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $q=[char]34; $argLine='/d /c '+$q+$q+$env:PHANTOM_BAT_PATH+$q+' /elevated'+$q; Start-Process -FilePath $env:ComSpec -ArgumentList $argLine -WorkingDirectory $env:PHANTOM_BAT_DIR -Verb RunAs" >> "%LAUNCH_LOG%" 2>&1
+if errorlevel 1 (
+    call :launcher_log "HATA: Yonetici izni penceresi acilamadi veya izin reddedildi."
+    call :show_error "PHANTOM baslatilamadi. Yonetici izni reddedildi veya Windows izin penceresi acilamadi."
+    exit /b 1
+)
+call :launcher_log "Yukseltilmis PHANTOM baslaticisi gonderildi; ilk pencere kapaniyor."
+exit /b 0
+
+:elevated_ready
+call :launcher_log "Yonetici yetkisi dogrulandi; on kontroller basliyor."
 
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 set "VENV_PYW=%~dp0.venv\Scripts\pythonw.exe"
-set "DEPS_CHECK=import certifi, cv2, easyocr, keyboard, mss, numpy, torch, webview, win32api, win32gui; from ultralytics import YOLO"
-set "READY_PY="
-
-if exist "%VENV_PY%" goto runtime_selected
-
-call :find_ready_python
-if not defined READY_PY goto run_setup
-
-set "VENV_PY=%READY_PY%"
-call :set_pythonw
-echo [OK] Hazir Python ortami bulundu: %VENV_PY%
-goto runtime_selected
-
-:run_setup
-echo [INFO] Hazir kurulum bulunamadi. kurulum.bat mevcut paketleri kontrol edecek...
-call "%~dp0kurulum.bat" /auto
-
-:runtime_selected
-
 if not exist "%VENV_PY%" (
-    echo [HATA] Sanal ortam bulunamadi. Once kurulum.bat dosyasini calistirin.
-    pause
+    call :launcher_log "HATA: Sanal ortam Python dosyasi bulunamadi."
+    call :show_error "PHANTOM Python ortami bulunamadi. Once kurulum.bat dosyasini calistirin."
     exit /b 1
 )
 if not exist "%VENV_PYW%" set "VENV_PYW=%VENV_PY%"
 
 set "PYTHONUTF8=1"
-"%VENV_PY%" -c "%DEPS_CHECK%" >nul 2>&1
-if not errorlevel 1 goto deps_ready
-
-call :find_ready_python
-if not defined READY_PY goto repair_setup
-
-set "VENV_PY=%READY_PY%"
-call :set_pythonw
-echo [OK] Yerel sanal ortam eksik/bozuk; hazir Python ortami kullaniliyor: %VENV_PY%
-goto deps_ready
-
-:repair_setup
-echo [INFO] Eksik veya bozuk kutuphane bulundu. kurulum.bat mevcut paketleri kontrol edecek...
-call "%~dp0kurulum.bat" /auto
-
-:deps_ready
-
-"%VENV_PY%" -c "%DEPS_CHECK%" >nul 2>&1
+"%VENV_PY%" -c "import sys" >nul 2>&1
 if errorlevel 1 (
-    echo [HATA] Gerekli kutuphaneler hala eksik. Once kurulum.bat dosyasini tamamlayin.
-    echo [INFO] Detay icin runtime\logs klasorundeki en yeni kurulum loguna bakin.
-    pause
+    call :launcher_log "HATA: Sanal ortam Python dosyasi calistirilamadi."
+    call :show_error "PHANTOM Python ortami acilamadi. Once kurulum.bat dosyasini calistirin."
     exit /b 1
 )
-
-"%VENV_PY%" -c "from src.phantom.captcha.solver import _easyocr_models_ready; raise SystemExit(0 if _easyocr_models_ready() else 1)" >nul 2>&1
-if errorlevel 1 (
-    echo [INFO] EasyOCR model cache eksik. kurulum.bat calistiriliyor...
-    call "%~dp0kurulum.bat" /auto
-)
-
-"%VENV_PY%" -c "from src.phantom.captcha.solver import _easyocr_models_ready; raise SystemExit(0 if _easyocr_models_ready() else 1)" >nul 2>&1
-if errorlevel 1 (
-    echo [HATA] EasyOCR model cache hazirlanamadi. Once kurulum.bat dosyasini tamamlayin.
-    echo [INFO] Detay icin runtime\logs klasorundeki en yeni kurulum loguna bakin.
-    pause
-    exit /b 1
-)
+call :launcher_log "Python ortami hazir; agir kutuphaneler uygulama icinde yuklenecek."
 
 set "PHANTOM_GUI_LAUNCH=1"
-start "" /D "%~dp0" "%VENV_PYW%" "%~dp0metin_bot_webview.py"
+set "PHANTOM_ENTRY=%~dp0metin_bot_webview.py"
+set "PHANTOM_ROOT=%~dp0"
+call :launcher_log "GUI sureci baslatiliyor: %VENV_PYW%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $q=[char]34; $entryArg=$q+$env:PHANTOM_ENTRY+$q; $p=Start-Process -FilePath $env:VENV_PYW -ArgumentList $entryArg -WorkingDirectory $env:PHANTOM_ROOT -PassThru; Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] GUI PID='+$p.Id); Start-Sleep -Seconds 12; if($p.HasExited){Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] HATA: GUI sureci erken kapandi. Cikis kodu='+$p.ExitCode); exit 1}; Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] GUI sureci 12 saniye sonra calisiyor.')" >> "%LAUNCH_LOG%" 2>&1
+if errorlevel 1 (
+    call :launcher_log "HATA: GUI sureci baslatilamadi veya erken kapandi."
+    call :show_error "PHANTOM penceresi baslatilamadi. Ayrinti: runtime\logs\launcher_latest.log"
+    exit /b 1
+)
+call :launcher_log "GUI sureci calisiyor; baslatici tamamlandi."
 exit /b 0
 
-:find_ready_python
-set "READY_PY="
-if exist "%LocalAppData%\Programs\Python\Python311\python.exe" (
-    call :check_python "%LocalAppData%\Programs\Python\Python311\python.exe"
-    if defined READY_PY exit /b 0
-)
-for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)" 2^>nul') do (
-    if not defined READY_PY call :check_python "%%P"
-)
-if defined READY_PY exit /b 0
-for /f "delims=" %%P in ('python -c "import sys; print(sys.executable)" 2^>nul') do (
-    if not defined READY_PY call :check_python "%%P"
-)
-if defined READY_PY exit /b 0
-for /f "delims=" %%P in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$roots=@('%~dp0..',(Join-Path $env:USERPROFILE 'Downloads')); foreach($root in $roots){ if(-not (Test-Path $root)){ continue }; foreach($f in (Get-ChildItem -Path $root -Filter python.exe -Recurse -ErrorAction SilentlyContinue)){ $p=$f.FullName; if($p -like '*\.venv\Scripts\python.exe' -and $p -like '*PHANTOM*'){ Write-Output $p } } }" 2^>nul') do (
-    if not defined READY_PY call :check_python "%%P"
-)
+:launcher_log
+>> "%LAUNCH_LOG%" echo [%date% %time%] %~1
 exit /b 0
 
-:check_python
-if not exist "%~1" exit /b 0
-"%~1" -c "%DEPS_CHECK%" >nul 2>&1
-if not errorlevel 1 set "READY_PY=%~1"
-exit /b 0
-
-:set_pythonw
-set "VENV_PYW=%VENV_PY%"
-for %%D in ("%VENV_PY%") do if exist "%%~dpDpythonw.exe" set "VENV_PYW=%%~dpDpythonw.exe"
+:show_error
+set "PHANTOM_LAUNCH_ERROR=%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show($env:PHANTOM_LAUNCH_ERROR,'PHANTOM baslatma hatasi',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)" >nul 2>&1
 exit /b 0

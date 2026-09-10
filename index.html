@@ -750,11 +750,15 @@
       height: 100%;
     }
 
-    #pageOps .grid-2 {
+    #pageOps .grid-clients {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(240px, 1fr));
+      gap: 10px;
       flex: 1;
       height: 100%;
       min-height: 0;
       grid-template-rows: minmax(0, 1fr);
+      overflow-x: auto;
     }
 
     #pageOps .panel {
@@ -772,6 +776,10 @@
     #pageOps .form-row {
       height: 28px;
       min-height: 28px;
+    }
+
+    #pageOps .form-row:has(input[id^="hpFillReady"]) {
+      display: none;
     }
 
     #pageOps .input-field {
@@ -824,7 +832,8 @@
 
     #pageControl .panel-body {
       display: grid;
-      grid-template-rows: repeat(3, minmax(0, 1fr));
+      grid-template-rows: none;
+      grid-auto-rows: minmax(0, 1fr);
       gap: 10px;
       height: 100%;
       min-height: 0;
@@ -903,12 +912,93 @@
       min-width: 0;
     }
 
+    .rumeli2-setup {
+      min-height: 0;
+      padding: 10px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      background: rgba(255, 255, 255, 0.018);
+    }
+
+    .rumeli2-setup.active {
+      border-color: rgba(59, 130, 246, 0.44);
+      background: linear-gradient(90deg, rgba(59, 130, 246, 0.09), rgba(255, 255, 255, 0.018));
+    }
+
+    .rumeli2-setup[hidden] {
+      display: none !important;
+    }
+
+    .rumeli2-copy {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .rumeli2-title {
+      color: var(--text-primary);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .rumeli2-desc {
+      color: var(--text-tertiary);
+      font-size: 9px;
+      line-height: 1.35;
+    }
+
+    .rumeli2-actions {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(84px, 1fr));
+      gap: 6px;
+    }
+
+    .calibration-btn {
+      min-height: 32px;
+      padding: 6px 9px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--bg-element);
+      color: var(--text-secondary);
+      font-family: var(--font-sans);
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+    }
+
+    .calibration-btn:hover {
+      border-color: var(--accent-blue);
+      color: var(--text-primary);
+      background: rgba(59, 130, 246, 0.10);
+    }
+
+    .calibration-btn:focus-visible {
+      outline: 2px solid var(--accent-blue);
+      outline-offset: 2px;
+    }
+
+    .calibration-btn.ready::after {
+      content: '  \2713';
+      color: var(--accent-green);
+    }
+
+    .calibration-btn:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
     #pageControl .stat-panel {
       margin-top: 0;
       height: 100%;
       min-height: 0;
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 10px;
       padding: 10px;
       border: 1px solid var(--border-subtle);
@@ -962,10 +1052,6 @@
         margin-bottom: 8px !important;
       }
 
-      #gTargetQueue {
-        min-width: 0;
-      }
-
       .input-wrapper[style] {
         flex-basis: 120px !important;
       }
@@ -978,6 +1064,20 @@
       #pageControl .input-wrapper[style] {
         flex: 1 1 auto !important;
         flex-basis: auto !important;
+      }
+
+      .rumeli2-setup {
+        grid-template-columns: 1fr;
+      }
+
+      .rumeli2-actions {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .calibration-btn {
+        transition-duration: 0.001ms;
       }
     }
   </style>
@@ -1009,6 +1109,7 @@
         <div class="client-toggle-group">
           <button class="client-toggle-btn" id="client1Toggle" onclick="toggleClientManual(1)" title="Client 1 aktif/pasif">C1 ON</button>
           <button class="client-toggle-btn" id="client2Toggle" onclick="toggleClientManual(2)" title="Client 2 aktif/pasif">C2 ON</button>
+          <button class="client-toggle-btn off" id="client3Toggle" onclick="toggleClientManual(3)" title="Client 3 aktif/pasif">C3 OFF</button>
         </div>
 
         <button class="btn-run" id="runBtn" onclick="toggleBot()">
@@ -1024,7 +1125,7 @@
 
     <!-- === SAYFA 1: İSTEMCİLER === -->
     <div class="page active" id="pageOps">
-      <div class="grid-2">
+      <div class="grid-clients">
 
         <!-- CLIENT 1 -->
         <div class="panel">
@@ -1073,10 +1174,20 @@
               <div class="input-wrapper">
                 <input type="text" class="input-field" id="hpReady1" value="Seçilmedi" readonly>
               </div>
-              <button class="icon-btn" onclick="selHp(1)" title="HP panel seç"><svg viewBox="0 0 24 24">
+              <button class="icon-btn" onclick="selHp(1)" title="Can %100 iken HP panelinin tamamını seç"><svg viewBox="0 0 24 24">
                   <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
                   <circle cx="8.5" cy="8.5" r="1.5"></circle>
                   <polyline points="21 15 16 10 5 21"></polyline>
+                </svg></button>
+            </div>
+            <div class="form-row">
+              <span class="form-label">Can Çubuğu</span>
+              <div class="input-wrapper">
+                <input type="text" class="input-field" id="hpFillReady1" value="Seçilmedi" readonly>
+              </div>
+              <button class="icon-btn" onclick="selHpFill(1)" title="Kırmızı can dolgusunu seç"><svg viewBox="0 0 24 24">
+                  <rect x="3" y="8" width="18" height="8" rx="2" ry="2"></rect>
+                  <path d="M6 12h12"></path>
                 </svg></button>
             </div>
 
@@ -1144,10 +1255,20 @@
               <div class="input-wrapper">
                 <input type="text" class="input-field" id="hpReady2" value="Seçilmedi" readonly>
               </div>
-              <button class="icon-btn" onclick="selHp(2)" title="HP panel seç"><svg viewBox="0 0 24 24">
+              <button class="icon-btn" onclick="selHp(2)" title="Can %100 iken HP panelinin tamamını seç"><svg viewBox="0 0 24 24">
                   <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
                   <circle cx="8.5" cy="8.5" r="1.5"></circle>
                   <polyline points="21 15 16 10 5 21"></polyline>
+                </svg></button>
+            </div>
+            <div class="form-row">
+              <span class="form-label">Can Çubuğu</span>
+              <div class="input-wrapper">
+                <input type="text" class="input-field" id="hpFillReady2" value="Seçilmedi" readonly>
+              </div>
+              <button class="icon-btn" onclick="selHpFill(2)" title="Kırmızı can dolgusunu seç"><svg viewBox="0 0 24 24">
+                  <rect x="3" y="8" width="18" height="8" rx="2" ry="2"></rect>
+                  <path d="M6 12h12"></path>
                 </svg></button>
             </div>
 
@@ -1164,6 +1285,87 @@
               <div class="feed-center"></div>
               <div class="feed-status" id="coff2">NO_SIGNAL</div>
               <div class="feed-metrics" id="cov2">FPS <span>0.0</span> • MS <span>--</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- CLIENT 3 -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Client 3</span>
+            <div class="status-indicator off" id="client3PanelStatus" title="Client 3 durumu">
+              <div class="status-dot"></div> Pasif
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="form-row">
+              <span class="form-label">Model</span>
+              <div class="input-wrapper">
+                <select class="input-field" id="mdl3">
+                  <option>Model seçilmedi</option>
+                </select>
+                <svg
+                  style="position:absolute; right:8px; top:10px; width:12px; height:12px; stroke:var(--text-tertiary); fill:none;"
+                  viewBox="0 0 24 24">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
+              <button class="icon-btn" onclick="selModel(3)" title="Model seç"><svg viewBox="0 0 24 24">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                </svg></button>
+            </div>
+            <div class="form-row">
+              <span class="form-label">Pencere</span>
+              <div class="input-wrapper">
+                <select class="input-field" id="win3" onchange="saveC(3)">
+                  <option>Pencere seçilmedi</option>
+                </select>
+                <svg
+                  style="position:absolute; right:8px; top:10px; width:12px; height:12px; stroke:var(--text-tertiary); fill:none;"
+                  viewBox="0 0 24 24">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
+              <button class="icon-btn" onclick="fillWins(3, null, false)" title="Pencere yenile"><svg viewBox="0 0 24 24">
+                  <polyline points="23 4 23 10 17 10"></polyline>
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                </svg></button>
+            </div>
+            <div class="form-row">
+              <span class="form-label">HP Panel</span>
+              <div class="input-wrapper">
+                <input type="text" class="input-field" id="hpReady3" value="Seçilmedi" readonly>
+              </div>
+              <button class="icon-btn" onclick="selHp(3)" title="Can %100 iken HP panelinin tamamını seç"><svg viewBox="0 0 24 24">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                  <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                  <polyline points="21 15 16 10 5 21"></polyline>
+                </svg></button>
+            </div>
+            <div class="form-row">
+              <span class="form-label">Can Çubuğu</span>
+              <div class="input-wrapper">
+                <input type="text" class="input-field" id="hpFillReady3" value="Seçilmedi" readonly>
+              </div>
+              <button class="icon-btn" onclick="selHpFill(3)" title="Kırmızı can dolgusunu seç"><svg viewBox="0 0 24 24">
+                  <rect x="3" y="8" width="18" height="8" rx="2" ry="2"></rect>
+                  <path d="M6 12h12"></path>
+                </svg></button>
+            </div>
+
+            <div class="feed-header">
+              <span class="panel-title">Canlı Görüntü</span>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span style="font-size:10px; color:var(--text-secondary);">Debug</span>
+                <label class="toggle"><input type="checkbox" id="dbg3" checked onchange="saveC(3)"><span class="slider"></span></label>
+              </div>
+            </div>
+
+            <div class="feed-container">
+              <img id="cfeed3" src="" alt="Client 3 debug feed" style="display:none">
+              <div class="feed-center"></div>
+              <div class="feed-status" id="coff3">NO_SIGNAL</div>
+              <div class="feed-metrics" id="cov3">FPS <span>0.0</span> • MS <span>--</span></div>
             </div>
           </div>
         </div>
@@ -1188,6 +1390,7 @@
                   <option value="tip4">Origins Çözümleyici</option>
                   <option value="tip1">Helios Algoritması</option>
                   <option value="tip2">Merlis Motoru</option>
+                  <option value="rumeli2">RUMELİ2 Eşleştirici</option>
                 </select>
                 <svg
                   style="position:absolute; right:8px; top:10px; width:12px; height:12px; stroke:var(--text-tertiary); fill:none;"
@@ -1195,6 +1398,19 @@
                   <polyline points="6 9 12 15 18 9"></polyline>
                 </svg>
               </div>
+            </div>
+
+            <div class="rumeli2-setup" id="rumeli2Setup">
+              <div class="rumeli2-copy">
+                <span class="rumeli2-title">RUMELİ2 alan kalibrasyonu</span>
+                <span class="rumeli2-desc">CAPTCHA'nın göründüğü herhangi bir Client'ı seç; soru ve dört seçenek alanı üçüne ortak kaydedilir.</span>
+              </div>
+              <div class="rumeli2-actions" aria-label="RUMELİ2 CAPTCHA kalibrasyonu">
+                <button type="button" class="calibration-btn" id="rumeli2Cal1" onclick="calibrateRumeli2(1)" aria-describedby="rumeli2CalibrationStatus">C1'den Seç</button>
+                <button type="button" class="calibration-btn" id="rumeli2Cal2" onclick="calibrateRumeli2(2)" aria-describedby="rumeli2CalibrationStatus">C2'den Seç</button>
+                <button type="button" class="calibration-btn" id="rumeli2Cal3" onclick="calibrateRumeli2(3)" aria-describedby="rumeli2CalibrationStatus">C3'ten Seç</button>
+              </div>
+              <span id="rumeli2CalibrationStatus" class="rumeli2-desc" aria-live="polite" style="position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0);"></span>
             </div>
 
             <div class="toggle-row" style="border-top: 1px solid var(--border-subtle); padding-top: 12px;">
@@ -1207,10 +1423,18 @@
 
             <div class="toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">Kurtarma</span>
-                <span class="toggle-desc">Takılma algılanırsa kurtarma uygular.</span>
+                <span class="toggle-title">Hareketli Metin Arama</span>
+                <span class="toggle-desc">Metin bulunamazsa Q tuşunu 1 saniye basılı tutarak en fazla 4 kez tarar; hâlâ yoksa 4 saniye sonra tekrarlar.</span>
               </div>
               <label class="toggle"><input type="checkbox" id="gAntiStuckGlobal" onchange="saveAntiSucukGlobal()"><span class="slider"></span></label>
+            </div>
+
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">Tanı Videosu</span>
+                <span class="toggle-desc" id="diagnosticVideoStatus">Tüm masaüstünü 2 FPS ve ses olmadan kaydeder; kayıtlar otomatik temizlenir.</span>
+              </div>
+              <label class="toggle"><input type="checkbox" id="gDiagnosticVideo" checked onchange="saveDiagnosticVideoGlobal()"><span class="slider"></span></label>
             </div>
 
           </div>
@@ -1227,21 +1451,6 @@
                 <span class="toggle-desc">Düşen öğeleri otomatik toplar.</span>
               </div>
               <label class="toggle"><input type="checkbox" id="gLoot" onchange="saveGlobalAdvanced()"><span class="slider"></span></label>
-            </div>
-
-            <div class="form-row" style="margin-top: 4px; margin-bottom: 12px;">
-              <span class="form-label" style="width:auto; margin-right:auto;">Hedef Kuyruğu</span>
-              <div class="input-wrapper" style="flex: 0 1 150px;">
-                <select class="input-field" id="gTargetQueue" onchange="saveTargetQueue()">
-                  <option value="on">Aktif</option>
-                  <option value="off">Kapalı</option>
-                </select>
-                <svg
-                  style="position:absolute; right:8px; top:10px; width:12px; height:12px; stroke:var(--text-tertiary); fill:none;"
-                  viewBox="0 0 24 24">
-                  <polyline points="6 9 12 15 18 9"></polyline>
-                </svg>
-              </div>
             </div>
 
             <!-- VERİ KUTULARI -->
@@ -1271,6 +1480,20 @@
                   <div style="text-align:right;">
                     <div class="stat-sub">Süre</div>
                     <div class="stat-value" id="sKU2" style="font-size:14px; color:var(--text-secondary);">00:00
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="stat-box">
+                <div class="stat-box-title">Client 3</div>
+                <div class="stat-value-group">
+                  <div>
+                    <div class="stat-sub">Toplam Kill</div>
+                    <div class="stat-value" id="sK3">0</div>
+                  </div>
+                  <div style="text-align:right;">
+                    <div class="stat-sub">Süre</div>
+                    <div class="stat-value" id="sKU3" style="font-size:14px; color:var(--text-secondary);">00:00
                     </div>
                   </div>
                 </div>
@@ -1307,7 +1530,7 @@
   </div>
 
   <script>
-    const CLIENT_IDS = [1, 2];
+    const CLIENT_IDS = [1, 2, 3];
     let lastConfig = null;
     let _trmLogs = [];
     let _trmClearedCount = 0;
@@ -1382,10 +1605,19 @@
     async function saveC(idx) {
       if (!apiReady()) return toast('pywebview API hazır değil');
       const data = clientFormData(idx);
-      await pywebview.api.save_client(idx, data);
+      const previousWindow = lastConfig?.[`c${idx}`]?.pencere ?? 'Yok';
+      const result = await pywebview.api.save_client(idx, data);
+      if (result?.ok === false) {
+        const win = document.getElementById(`win${idx}`);
+        if (win) win.value = previousWindow;
+        toast(result.error || 'İstemci ayarı kaydedilemedi');
+        await refreshAllWins(true);
+        return;
+      }
       lastConfig = lastConfig || {};
       lastConfig[`c${idx}`] = { ...(lastConfig[`c${idx}`] || {}), ...data };
       toast(`${idx}. istemci kaydedildi`);
+      await refreshAllWins(true);
     }
 
     function syncHeaderClientToggle(idx, active) {
@@ -1410,7 +1642,11 @@
       lastConfig = lastConfig || {};
       const current = lastConfig?.[`c${idx}`]?.aktif !== false;
       const next = !current;
-      await pywebview.api.save_client(idx, { aktif: next });
+      const result = await pywebview.api.save_client(idx, { aktif: next });
+      if (result?.ok === false) {
+        toast(result.error || 'İstemci durumu değiştirilemedi');
+        return;
+      }
       lastConfig[`c${idx}`] = { ...(lastConfig[`c${idx}`] || {}), aktif: next };
       syncHeaderClientToggle(idx, next);
       toast(`${idx}. istemci ${next ? 'aktif' : 'pasif'}`);
@@ -1437,7 +1673,15 @@
       await pywebview.api.select_hp_bar(idx);
       const hp = document.getElementById(`hpReady${idx}`);
       if (hp) hp.value = 'Seçim bekleniyor';
-      toast('HP panel seçim ekranı açıldı');
+      toast('Can %100 iken HP panelinin tamamını seçin ve Enter’a basın');
+    }
+
+    async function selHpFill(idx) {
+      if (!apiReady()) return toast('pywebview API hazır değil');
+      await pywebview.api.select_hp_fill(idx);
+      const hpFill = document.getElementById(`hpFillReady${idx}`);
+      if (hpFill) hpFill.value = 'Seçim bekleniyor';
+      toast('Kırmızı can çubuğunu seçin ve Enter’a basın');
     }
 
     function isAssignableWindow(win) {
@@ -1449,14 +1693,18 @@
       if (!sel || !apiReady()) return;
       const prev = cur ?? sel.value ?? lastConfig?.[`c${idx}`]?.pencere ?? 'Yok';
       const wins = await pywebview.api.get_windows();
-      const otherIdx = idx === 1 ? 2 : 1;
-      const otherValue = document.getElementById(`win${otherIdx}`)?.value ?? lastConfig?.[`c${otherIdx}`]?.pencere ?? 'Yok';
+      const usedByOtherClients = new Set(
+        CLIENT_IDS
+          .filter(otherIdx => otherIdx !== idx && lastConfig?.[`c${otherIdx}`]?.aktif !== false)
+          .map(otherIdx => document.getElementById(`win${otherIdx}`)?.value ?? lastConfig?.[`c${otherIdx}`]?.pencere ?? 'Yok')
+          .filter(isAssignableWindow)
+      );
       sel.innerHTML = '';
       wins.forEach(win => {
         const opt = document.createElement('option');
-        const locked = isAssignableWindow(win) && win === otherValue && win !== prev;
+        const locked = isAssignableWindow(win) && usedByOtherClients.has(win) && win !== prev;
         opt.value = win;
-        opt.textContent = locked ? `${win} [diğer istemci]` : win;
+        opt.textContent = locked ? `${win} [başka Client kullanıyor]` : win;
         opt.disabled = locked;
         if (win === prev) opt.selected = true;
         sel.appendChild(opt);
@@ -1466,8 +1714,9 @@
     }
 
     async function refreshAllWins(silent = true) {
-      await fillWins(1, lastConfig?.c1?.pencere ?? 'Yok', true);
-      await fillWins(2, lastConfig?.c2?.pencere ?? 'Yok', true);
+      for (const idx of CLIENT_IDS) {
+        await fillWins(idx, lastConfig?.[`c${idx}`]?.pencere ?? 'Yok', true);
+      }
       if (!silent) toast('Pencere listeleri yenilendi');
     }
 
@@ -1479,8 +1728,9 @@
         captcha_tip1: cfg?.captcha_tip1 ?? cfg?.c1?.captcha_tip1 ?? false,
         captcha_tip2: cfg?.captcha_tip2 ?? cfg?.c1?.captcha_tip2 ?? false,
         captcha_tip4: cfg?.captcha_tip4 ?? cfg?.c1?.captcha_tip4 ?? false,
+        captcha_rumeli2: cfg?.captcha_rumeli2 ?? cfg?.c1?.captcha_rumeli2 ?? false,
         anti_sucuk: cfg?.anti_sucuk ?? false,
-        hedef_kuyruk_aktif: cfg?.hedef_kuyruk_aktif ?? ['2', '3', '4', '5', 'aktif', 'true', '1', 'on'].includes(String(cfg?.hedef_kuyruk_sayisi ?? cfg?.c1?.hedef_kuyruk_sayisi ?? 'default').toLowerCase()),
+        diagnostic_video_enabled: cfg?.diagnostic_video_enabled ?? true,
       };
     }
 
@@ -1492,26 +1742,72 @@
       if (msg) msg.checked = !!src.message_captcha;
       if (anti) anti.checked = !!src.anti_sucuk;
       if (type) {
-        if (!src.captcha && !src.captcha_tip1 && !src.captcha_tip2 && !src.captcha_tip4) type.value = 'off';
+        if (!src.captcha && !src.captcha_tip1 && !src.captcha_tip2 && !src.captcha_tip4 && !src.captcha_rumeli2) type.value = 'off';
+        else if (src.captcha_rumeli2) type.value = 'rumeli2';
         else if (src.captcha_tip4) type.value = 'tip4';
         else if (src.captcha_tip2) type.value = 'tip2';
         else if (src.captcha_tip1) type.value = 'tip1';
         else type.value = 'off';
+      }
+      syncRumeli2Setup(cfg || lastConfig || {}, type?.value === 'rumeli2');
+    }
+
+    function hasRumeli2Calibration(clientCfg) {
+      return Array.isArray(clientCfg?.rumeli2_question_region)
+        && clientCfg.rumeli2_question_region.length === 4
+        && Array.isArray(clientCfg?.rumeli2_option_regions)
+        && clientCfg.rumeli2_option_regions.length === 4;
+    }
+
+    function syncRumeli2Setup(cfg, active) {
+      const setup = document.getElementById('rumeli2Setup');
+      if (setup) {
+        setup.hidden = false;
+        setup.classList.toggle('active', !!active);
+      }
+      const states = [];
+      CLIENT_IDS.forEach(idx => {
+        const ready = hasRumeli2Calibration(cfg?.[`c${idx}`]);
+        const button = document.getElementById(`rumeli2Cal${idx}`);
+        if (button) {
+          button.classList.toggle('ready', ready);
+          button.textContent = ready ? `C${idx} Hazır` : `C${idx}'den Seç`;
+          button.title = `Client ${idx} penceresinden ortak CAPTCHA alanlarını seç`;
+        }
+        states.push(`C${idx} ${ready ? 'hazır' : 'kalibre edilmedi'}`);
+      });
+      const status = document.getElementById('rumeli2CalibrationStatus');
+      if (status) status.textContent = states.join(', ');
+    }
+
+    async function calibrateRumeli2(idx) {
+      if (!apiReady()) return toast('pywebview API hazır değil');
+      const button = document.getElementById(`rumeli2Cal${idx}`);
+      if (button) button.disabled = true;
+      toast(`Client ${idx} penceresi yakalanıyor; soru ve dört seçeneği sırayla işaretle`);
+      try {
+        const result = await pywebview.api.select_rumeli2_captcha(idx);
+        if (result?.ok) {
+          lastConfig = await pywebview.api.get_config();
+          syncCaptchaGlobal(lastConfig || {});
+          toast(`RUMELİ2 alanları Client 1, 2 ve 3 için ortak kaydedildi`);
+        } else if (!result?.cancelled) {
+          toast(result?.error || 'Kalibrasyon tamamlanamadı');
+        }
+      } catch (err) {
+        console.error(err);
+        toast('Kalibrasyon sırasında hata oluştu');
+      } finally {
+        if (button) button.disabled = false;
       }
     }
 
     function syncGlobalAdvanced(cfg) {
       const src = globalAdvancedSource(cfg || lastConfig || {});
       const loot = document.getElementById('gLoot');
+      const diagnosticVideo = document.getElementById('gDiagnosticVideo');
       if (loot) loot.checked = !!src.oto_loot;
-      syncTargetQueuePicker(cfg);
-    }
-
-    function syncTargetQueuePicker(cfg) {
-      const el = document.getElementById('gTargetQueue');
-      if (!el) return;
-      const src = globalAdvancedSource(cfg || lastConfig || {});
-      el.value = src.hedef_kuyruk_aktif ? 'on' : 'off';
+      if (diagnosticVideo) diagnosticVideo.checked = src.diagnostic_video_enabled !== false;
     }
 
     async function saveCaptchaGlobal() {
@@ -1523,10 +1819,12 @@
         captcha_tip2: selected === 'tip2',
         captcha_tip3: false,
         captcha_tip4: selected === 'tip4',
+        captcha_rumeli2: selected === 'rumeli2',
         message_captcha: !!document.getElementById('gMsgCap')?.checked,
       };
       await pywebview.api.save_global(payload);
       lastConfig = { ...(lastConfig || {}), ...payload };
+      syncCaptchaGlobal(lastConfig);
       toast('Güvenlik ayarları kaydedildi');
     }
 
@@ -1534,15 +1832,10 @@
       if (!apiReady()) return toast('pywebview API hazır değil');
       const payload = {
         anti_sucuk: !!document.getElementById('gAntiStuckGlobal')?.checked,
-        anti_aranma_aktif: false,
-        anti_aranma_sn: 0,
-        anti_stuck_sn: 20,
-        anti_hareketsiz_sn: 20,
-        anti_kurtarma_bekleme_sn: 5,
       };
       await pywebview.api.save_global(payload);
       lastConfig = { ...(lastConfig || {}), ...payload };
-      toast('Kurtarma ayarı kaydedildi');
+      toast('Hareketli Metin Arama ayarı kaydedildi');
     }
 
     async function saveGlobalAdvanced() {
@@ -1553,20 +1846,23 @@
       toast('Otomasyon ayarı kaydedildi');
     }
 
-    async function saveTargetQueue() {
+    async function saveDiagnosticVideoGlobal() {
       if (!apiReady()) return toast('pywebview API hazır değil');
-      const active = document.getElementById('gTargetQueue')?.value === 'on';
-      const payload = { hedef_kuyruk_aktif: active, hedef_kuyruk_sayisi: active ? 'aktif' : 'default' };
+      const payload = {
+        diagnostic_video_enabled: !!document.getElementById('gDiagnosticVideo')?.checked,
+      };
       await pywebview.api.save_global(payload);
       lastConfig = { ...(lastConfig || {}), ...payload };
-      toast(active ? 'Hedef kuyruğu aktif' : 'Hedef kuyruğu kapalı');
+      toast(payload.diagnostic_video_enabled ? 'Tanı videosu açıldı' : 'Tanı videosu kapatıldı');
     }
 
     async function resetKills() {
       if (!apiReady()) return toast('pywebview API hazır değil');
       await pywebview.api.reset_kills();
-      document.getElementById('sK1').textContent = '0';
-      document.getElementById('sK2').textContent = '0';
+      CLIENT_IDS.forEach(idx => {
+        const kill = document.getElementById(`sK${idx}`);
+        if (kill) kill.textContent = '0';
+      });
       toast('Farm verileri sıfırlandı');
       await loop();
     }
@@ -1657,13 +1953,36 @@
       CLIENT_IDS.forEach(i => {
         const client = status?.clients?.[String(i)] || {};
         syncHeaderClientToggle(i, client.aktif !== false);
+        const panelStatus = document.getElementById(`client${i}PanelStatus`);
+        if (panelStatus && client.aktif !== false && client.durum === 'PENCERE CAKISMASI') {
+          panelStatus.classList.add('off');
+          panelStatus.innerHTML = '<div class="status-dot"></div> Çakışma';
+          panelStatus.title = `Client ${i}: aynı pencere başka bir aktif Client tarafından kullanılıyor`;
+        }
         const hp = document.getElementById(`hpReady${i}`);
-      if (hp) hp.value = client.hp_template ? 'Hazır' : 'Seçilmedi';
+        if (hp) hp.value = client.hp_template ? 'Hazır' : 'Seçilmedi';
+        if (hp) hp.value = client.hp_panel_auto ? 'Hazır · Otomatik' : (client.hp_template ? 'Yeniden seç' : 'Seçilmedi');
+        const hpFill = document.getElementById(`hpFillReady${i}`);
+        if (hpFill) hpFill.value = client.hp_fill_ready ? 'Hazır' : 'Seçilmedi';
         const kill = document.getElementById(`sK${i}`);
         const time = document.getElementById(`sKU${i}`);
         if (kill) kill.textContent = String(client.kill_count ?? 0);
         if (time) time.textContent = elapsed;
       });
+      const videoStatus = document.getElementById('diagnosticVideoStatus');
+      const diagnosticVideo = status?.diagnostic_video || {};
+      if (videoStatus) {
+        if (!diagnosticVideo.enabled) {
+          videoStatus.textContent = 'Kayıt kapalı. Açıldığında tüm masaüstünü 2 FPS ve ses olmadan kaydeder.';
+        } else if (diagnosticVideo.recording) {
+          const file = String(diagnosticVideo.current_file || '').split(/[\\/]/).pop();
+          videoStatus.textContent = `Kayıt aktif · ${file || 'video hazırlanıyor'} · ses yok`;
+        } else if (diagnosticVideo.last_error) {
+          videoStatus.textContent = `Kayıt hatası: ${diagnosticVideo.last_error}`;
+        } else {
+          videoStatus.textContent = 'Kayıt hazırlanıyor · 2 FPS · ses yok';
+        }
+      }
     }
 
     async function loop() {

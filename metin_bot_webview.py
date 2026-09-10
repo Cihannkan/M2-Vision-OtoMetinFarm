@@ -27,16 +27,20 @@ def _redirect_output_for_gui_launch():
 
 
 _redirect_output_for_gui_launch()
+print("[STARTUP] PHANTOM giris noktasi calisti.", flush=True)
 
 try:
     from src.phantom.app.main import main
 except Exception:
     traceback.print_exc()
     raise
+else:
+    print("[STARTUP] Uygulama modulu yuklendi.", flush=True)
 
 
 if __name__ == "__main__":
     try:
+        print("[STARTUP] Ana pencere olusturuluyor.", flush=True)
         main()
     except Exception:
         traceback.print_exc()
