@@ -12,6 +12,7 @@ import re
 import difflib
 import unicodedata
 import glob
+import hashlib
 import subprocess
 from collections import deque
 
@@ -28,6 +29,7 @@ from tkinter import filedialog
 import torch
 
 from ..diagnostic_video import DiagnosticVideoRecorder
+from ..lifecycle import InstanceLock, ManagedLifecycle
 from ..vision.directml import create_detection_model, preferred_backend
 from ..vision.survival import detect_death_menu, own_hp_visible, remember_failed_target, filter_failed_targets
 from ..vision.combat import (
@@ -76,10 +78,11 @@ except ImportError:
         return bool(status and status != "dialog_yok")
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(PACKAGE_DIR, "..", "..", ".."))
+RELEASE_ROOT = os.path.abspath(os.path.join(PACKAGE_DIR, "..", "..", ".."))
+PROJECT_ROOT = os.path.abspath(os.environ.get("PHANTOM_DATA_ROOT", RELEASE_ROOT))
 SCRIPT_DIR = PROJECT_ROOT
 CONFIG_FILE = os.path.join(PROJECT_ROOT, "config_phantom.json")
-HTML_FILE = os.path.join(PROJECT_ROOT, "index.html")
+HTML_FILE = os.path.join(RELEASE_ROOT, "index.html")
 HP_TEMPLATE_DIR = os.path.join(PROJECT_ROOT, "templates", "hp_templates")
 MESSAGE_TEMPLATE_DIR = os.path.join(PROJECT_ROOT, "templates", "message_templates")
 RUMELI2_CALIBRATION_DIR = os.path.join(PROJECT_ROOT, "templates", "rumeli2_captcha")
@@ -142,12 +145,15 @@ APPROACH_HP_DROP_MIN = 0.018
 APPROACH_HP_DROP_CONFIRM_SN = 0.25
 APPROACH_INITIAL_STILL_SN = 8.0
 APPROACH_NO_PANEL_TIMEOUT_SN = 5.0
-RECOVERY_MOVES = (("d", 2.0), ("a", 4.0), ("d", 6.0))
+RECOVERY_SKILL_KEY = "1"
+RECOVERY_SKILL_TAP_SN = 0.10
+RECOVERY_SKILL_WAIT_SN = 4.0
+RECOVERY_RECLICK_TIMEOUT_SN = 4.0
+RECOVERY_RECLICK_RADIUS = 240.0
 # Uc manevra ve aralarindaki hasar kontrolleri icin yeterli sure tani.
 APPROACH_MAX_SN = 45.0
-APPROACH_RECOVERY_MAX = len(RECOVERY_MOVES)
-APPROACH_SPACE_HOLD_SN = 1.0
-APPROACH_POST_RECOVERY_WAIT_SN = 3.0
+APPROACH_RECOVERY_MAX = 3
+APPROACH_POST_RECOVERY_WAIT_SN = RECOVERY_SKILL_WAIT_SN
 APPROACH_BLOCKED_TARGET_SN = 11.0
 VISION_STALE_FRAME_SN = 2.0
 VISION_STALE_LOG_EVERY_SN = 5.0
@@ -155,8 +161,8 @@ VISION_STALE_LOG_EVERY_SN = 5.0
 # esigi iki piksel bekledigi icin dusuk hasarda 6sn'lik sahte takilma uretiyordu.
 COMBAT_HP_PROGRESS_MIN = 0.006
 COMBAT_NO_PROGRESS_SN = 6.0
-COMBAT_POST_RECOVERY_WAIT_SN = 3.0
-COMBAT_RECOVERY_MAX = len(RECOVERY_MOVES)
+COMBAT_POST_RECOVERY_WAIT_SN = RECOVERY_SKILL_WAIT_SN
+COMBAT_RECOVERY_MAX = 3
 # Son gorulen can sifira cok yakinsa panelin kapanmasi olum kanitidir. Daha
 # yuksek canda kaybolan panel belirsizdir; loot veya hedef degisimi uretmez.
 COMBAT_DEATH_LOW_HP_MAX = 0.06
@@ -1122,6 +1128,7 @@ class ActionThread(threading.Thread):
         self._s_basmis = {}
         self._anti_sucuk_diag_t = {}
         self._approach = {}
+        self._recovery_reclick = {}
         self._approach_diag_t = {}
         self._approach_blocked_target = {}
         self._stale_frame_diag_t = {}
@@ -1850,9 +1857,8 @@ class ActionThread(threading.Thread):
                 self._buff_log_throttled(w, "deferred", f"[BUFF] guvenli ana ertelendi{pending} ({w})")
 
     def _run_approach_recovery(self, w, hwnd, attempt):
-        if not 1 <= attempt <= len(RECOVERY_MOVES):
+        if not 1 <= attempt <= APPROACH_RECOVERY_MAX:
             return False
-        move_key, move_seconds = RECOVERY_MOVES[attempt - 1]
         if self._recovery_input_blocked(w):
             return False
         if not pencere_odakla(hwnd):
@@ -1863,15 +1869,10 @@ class ActionThread(threading.Thread):
         log_event(
             self.st,
             "warn",
-            f"Yaklasma kurtarmasi {attempt}/{APPROACH_RECOVERY_MAX}: SPACE {APPROACH_SPACE_HOLD_SN:.0f}sn + {move_key.upper()} {move_seconds:.0f}sn ({w})",
+            f"Yaklasma kurtarmasi {attempt}/{APPROACH_RECOVERY_MAX}: {self._recovery_description(attempt)} ({w})",
         )
-        if not self._hold_recovery_key(w, "space", APPROACH_SPACE_HOLD_SN, hwnd):
-            log_event(self.st, "warn", f"Yaklasma kurtarmasi SPACE sirasinda iptal edildi ({w})")
-            return False
-        if self._stop_event.wait(0.08) or self._recovery_input_blocked(w):
-            return False
-        if not self._hold_recovery_key(w, move_key, move_seconds, hwnd):
-            log_event(self.st, "warn", f"Yaklasma kurtarmasi {move_key.upper()} sirasinda iptal edildi ({w})")
+        if not self._run_obstacle_recovery(w, hwnd, attempt):
+            log_event(self.st, "warn", f"Yaklasma kurtarmasi iptal edildi ({w})")
             return False
         log_event(self.st, "info", f"Yaklasma kurtarmasi tamamlandi; hareket/hasar yeniden kontrol ediliyor ({w})")
         return True
@@ -1891,28 +1892,116 @@ class ActionThread(threading.Thread):
         floor_text = "--" if hp_floor is None else f"{float(hp_floor) * 100:.1f}"
         no_progress = time.time() - float(progress.get("last_progress", time.time()) or time.time())
         attempt = int(progress.get("recoveries", 0) or 0) + 1
-        if not 1 <= attempt <= len(RECOVERY_MOVES):
+        if not 1 <= attempt <= COMBAT_RECOVERY_MAX:
             return False
-        move_key, move_seconds = RECOVERY_MOVES[attempt - 1]
         log_event(
             self.st,
             "warn",
             f"Savas ilerlemiyor: can=%{fill_text}, taban=%{floor_text}, "
             f"{no_progress:.1f}sn yeni dusus yok; kurtarma {attempt}/{COMBAT_RECOVERY_MAX}: "
-            f"SPACE {APPROACH_SPACE_HOLD_SN:.0f}sn + {move_key.upper()} {move_seconds:.0f}sn ({w})",
+            f"{self._recovery_description(attempt)} ({w})",
         )
-        if not self._hold_recovery_key(w, "space", APPROACH_SPACE_HOLD_SN, hwnd):
-            log_event(self.st, "warn", f"Savas kurtarmasi SPACE sirasinda iptal edildi ({w})")
-            return False
-        if self._stop_event.wait(0.08) or self._recovery_input_blocked(w):
-            return False
-        if not self._hold_recovery_key(w, move_key, move_seconds, hwnd):
-            log_event(self.st, "warn", f"Savas kurtarmasi {move_key.upper()} sirasinda iptal edildi ({w})")
+        if not self._run_obstacle_recovery(w, hwnd, attempt):
+            log_event(self.st, "warn", f"Savas kurtarmasi iptal edildi ({w})")
             return False
         log_event(self.st, "info", f"Savas kurtarmasi tamamlandi; can ilerlemesi yeniden kontrol ediliyor ({w})")
         return True
 
+    @staticmethod
+    def _recovery_description(attempt):
+        return {1: "at yetenegi 1; 4sn hasar kontrolu",
+                2: "S 1sn + D 2sn; taze hedefi yeniden tikla",
+                3: "S 1sn + A 4sn; taze hedefi yeniden tikla"}[attempt]
+
+    def _run_obstacle_recovery(self, w, hwnd, attempt):
+        if attempt == 1:
+            return self._hold_recovery_key(w, RECOVERY_SKILL_KEY, RECOVERY_SKILL_TAP_SN, hwnd)
+        if attempt not in (2, 3):
+            return False
+        if not self._hold_recovery_key(w, "s", 1.0, hwnd):
+            return False
+        key, seconds = ("d", 2.0) if attempt == 2 else ("a", 4.0)
+        if not self._hold_recovery_key(w, key, seconds, hwnd):
+            return False
+        finished = time.time()
+        # Never reuse pre-movement screen coordinates. The action loop waits
+        # for a post-movement capture, without blocking the other clients.
+        self._recovery_reclick[w] = {
+            "after": finished, "attempt": attempt, "hwnd": hwnd,
+            "phase": self.dur.get(w),
+            "generation": self._target_generation.get(w, 0),
+            "started": self._approach.get(w, {}).get("started", finished),
+            "pos": getattr(self, "_kilitli_hedef", {}).get(w),
+        }
+        return True
+
+    def _handle_recovery_reclick(self, w, hwnd, cc, targets, data_ts, ox, oy, client_idx=None):
+        pending = self._recovery_reclick.get(w)
+        if not pending:
+            return False
+        if (pending["hwnd"] != hwnd or pending["phase"] != self.dur.get(w)
+                or pending["generation"] != self._target_generation.get(w, 0)):
+            self._recovery_reclick.pop(w, None)
+            return False
+        now = time.time()
+        if self._recovery_input_blocked(w):
+            return True
+        if now - pending["after"] >= RECOVERY_RECLICK_TIMEOUT_SN:
+            abandon = self._abandon_combat_target if pending["phase"] == "SAVASIYOR" else self._abandon_approach_target
+            abandon(w, cc, now, "manevra sonrasi metin taze goruntude yeniden bulunamadi")
+            return True
+        if data_ts <= pending["after"] or not self._default_frame_fresh(w, data_ts, now):
+            return True
+        previous = pending.get("pos")
+        if not previous:
+            return True
+        # Screen-space association is conservative, not persistent world ID.
+        # Require current two-frame-confirmed detections, not target memory.
+        candidates = []
+        for target in targets or []:
+            if not isinstance(target, dict) or not target.get("stable_click"):
+                continue
+            center = self._target_center_xy(target)
+            distance = ((center[0] - previous[0]) ** 2 + (center[1] - previous[1]) ** 2) ** 0.5
+            if distance <= RECOVERY_RECLICK_RADIUS and self._filter_target_failures(w, [center], now):
+                candidates.append((distance, center))
+        if not candidates:
+            return True
+        candidates.sort(key=lambda item: item[0])
+        # Two equally plausible stones: do not guess which was the old target.
+        if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 40.0:
+            return True
+        center = candidates[0][1]
+        x, y = int(round(center[0] + ox)), int(round(center[1] + oy))
+        with input_transaction_lock:
+            if self._recovery_input_blocked(w):
+                return True
+            click_mode = _tiklama_yap(self.cfg, x, y, hwnd)
+        self._log_click_result(w, click_mode, x=x, y=y, client_idx=client_idx)
+        if click_mode in ("blocked", "focus_failed"):
+            return True
+        clicked_at = time.time()
+        self._kilitli_hedef[w] = center
+        self._start_target_generation(w, client_idx, clicked_at)
+        self._clear_combat_progress(w)
+        self._begin_approach(w, clicked_at)
+        self._approach[w].update(
+            started=pending["started"], recoveries=pending["attempt"],
+            check_after=clicked_at + RECOVERY_SKILL_WAIT_SN,
+        )
+        self._hp_onceki_durum.pop(w, None)
+        self._hp_kayip_t.pop(w, None)
+        self._hp_ignore_until.pop(w, None)
+        self._son_tiklama_t[w] = clicked_at
+        self.dur[w] = "DOGRULAMA"
+        self.dogr_t[w] = clicked_at
+        self.dogr_n[w] = 0
+        self._recovery_reclick.pop(w, None)
+        log_event(self.st, "info", f"Manevra sonrasi metin yeniden tiklandi; 4sn hasar kontrolu, deneme sayaci korundu ({w})")
+        return True
+
     def _abandon_approach_target(self, w, cc, now, reason):
+        getattr(self, "_recovery_reclick", {}).pop(w, None)
         self._remember_target_failure(w, now)
         locked = getattr(self, "_kilitli_hedef", {}).get(w)
         if locked:
@@ -1936,6 +2025,7 @@ class ActionThread(threading.Thread):
         )
 
     def _abandon_combat_target(self, w, cc, now, reason):
+        getattr(self, "_recovery_reclick", {}).pop(w, None)
         self._remember_target_failure(w, now)
         locked = getattr(self, "_kilitli_hedef", {}).get(w)
         if locked:
@@ -2345,7 +2435,7 @@ class ActionThread(threading.Thread):
             # Invalid/hidden HP must not skip the 8-second approach recovery.
             missing_since = approach.setdefault("panel_missing_since", now)
             retries = int(approach.get("recoveries", 0))
-            wait_for = APPROACH_INITIAL_STILL_SN if not retries else COMBAT_NO_PROGRESS_SN
+            wait_for = APPROACH_INITIAL_STILL_SN if not retries else RECOVERY_SKILL_WAIT_SN
             if now - missing_since < wait_for or now < approach.get("check_after", 0):
                 return
             if retries >= APPROACH_RECOVERY_MAX or elapsed >= APPROACH_MAX_SN:
@@ -2355,7 +2445,7 @@ class ActionThread(threading.Thread):
                 resumed = time.time()
                 approach["recoveries"] = retries + 1
                 approach["panel_missing_since"] = resumed
-                approach["check_after"] = resumed + COMBAT_NO_PROGRESS_SN
+                approach["check_after"] = resumed + RECOVERY_SKILL_WAIT_SN
             return
         approach.pop("panel_missing_since", None)
 
@@ -2387,7 +2477,7 @@ class ActionThread(threading.Thread):
             return
 
         if recoveries >= APPROACH_RECOVERY_MAX:
-            self._abandon_approach_target(w, cc, now, "3 kurtarma (D2/A4/D6) sonrasinda hasar yok")
+            self._abandon_approach_target(w, cc, now, "at yetenegi ve geri/sag/sol kurtarmasi sonrasinda hasar yok")
             return
 
         attempt = recoveries + 1
@@ -2497,7 +2587,8 @@ class ActionThread(threading.Thread):
 
                 last_progress = float(progress.get("last_progress", now) or now)
                 check_after = float(progress.get("check_after", now) or now)
-                if now < check_after or now - last_progress < COMBAT_NO_PROGRESS_SN:
+                recovery_wait = RECOVERY_SKILL_WAIT_SN if progress.get("recoveries", 0) else COMBAT_NO_PROGRESS_SN
+                if now < check_after or now - last_progress < recovery_wait:
                     return
 
                 recoveries = int(progress.get("recoveries", 0) or 0)
@@ -2564,6 +2655,7 @@ class ActionThread(threading.Thread):
                     total_missing_for = now - total_missing_since
                     recoveries = int(progress.get("recoveries", 0) or 0)
                     check_after = float(progress.get("check_after", 0) or 0)
+                    recovery_wait = RECOVERY_SKILL_WAIT_SN if recoveries else COMBAT_PANEL_LOST_RECOVERY_SN
 
                     if (
                         missing_samples >= COMBAT_DEATH_MIN_ABSENT_SAMPLES
@@ -2571,7 +2663,7 @@ class ActionThread(threading.Thread):
                             total_missing_for >= COMBAT_PANEL_LOST_TIMEOUT_SN
                             or (
                                 recoveries >= COMBAT_RECOVERY_MAX
-                                and missing_for >= COMBAT_PANEL_LOST_RECOVERY_SN
+                                and missing_for >= recovery_wait
                             )
                         )
                     ):
@@ -2585,7 +2677,7 @@ class ActionThread(threading.Thread):
 
                     if (
                         missing_samples >= COMBAT_DEATH_MIN_ABSENT_SAMPLES
-                        and missing_for >= COMBAT_PANEL_LOST_RECOVERY_SN
+                        and missing_for >= recovery_wait
                         and now >= check_after
                     ):
                         if self._run_combat_recovery(w, hwnd):
@@ -2782,6 +2874,7 @@ class ActionThread(threading.Thread):
                 self._hp_onceki_durum.clear(); self._son_tiklama_t.clear()
                 self._hp_ignore_until.clear(); self._hp_kayip_t.clear()
                 self._approach.clear(); self._approach_blocked_target.clear()
+                self._recovery_reclick.clear()
                 self._stale_frame_diag_t.clear()
                 self._combat_progress.clear()
                 self._target_generation.clear(); self._last_target_sample.clear()
@@ -2893,6 +2986,8 @@ class ActionThread(threading.Thread):
 
                 try:
                     action_ts = publish_ts or data_ts
+                    if self._handle_recovery_reclick(w, hwnd, cc, hedefler, data_ts, ox, oy, client_idx):
+                        continue
                     if state == "ARANIYOR":
                         if not hp_var and not self._default_frame_fresh(w, action_ts, now):
                             continue
@@ -4213,21 +4308,12 @@ class VisionThread(threading.Thread):
                     if not hasattr(self.st, "life_data"):
                         self.st.life_data = {}
                     self.st.life_data[pk] = death
-                if death.get("visible"):
+                death_visible = bool(death.get("visible"))
+                if death_visible:
                     guncel[pk] = self._publish_client_vision(pk, {"merkezler": [], "hp_var": False,
                         "hwnd": hwnd, "client_cfg": cc, "client_idx": ci,
                         "ts": frame_capture_ts, "target_generation": frame_target_generation})
-                    continue
 
-                # Dunyadaki sabit detaylari seyrek optik akisla izle. Yerel mob ve
-                # beceri animasyonlari yerine genis alana yayilan tutarli kayma aranir.
-                try:
-                    scene_motion = self._measure_scene_motion(pk, img, time.time())
-                except Exception:
-                    scene_motion = {
-                        "ready": False, "moving": False, "score": 0.0,
-                        "confidence": 0.0, "points": 0,
-                    }
                 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
                 # â”€â”€ CAPTCHA â”€â”€
@@ -4311,7 +4397,9 @@ class VisionThread(threading.Thread):
                                 log_event(
                                     self.st,
                                     "warn",
-                                    f"Client {ci} CAPTCHA kalibrasyonu eksik; farm ve canli goruntu engellenmeden devam ediyor",
+                                    f"Client {ci} CAPTCHA kullanima hazir degil: {status}"
+                                    f"{(' - ' + detail) if detail else ''}; "
+                                    "farm ve canli goruntu engellenmeden devam ediyor",
                                 )
                                 self._captcha_last_log[log_key] = time.time()
                         if status in ("hedef_yok", "eslesme_yok", "ocr_yok", "ocr_hata", "tip_yok", "grid_yok", "grid_az", "farkli_yok", "rumeli2_belirsiz"):
@@ -4353,6 +4441,22 @@ class VisionThread(threading.Thread):
                     else:
                         self._set_global_captcha(pk, ci, status or "captcha kontrol")
                         continue
+
+                # Olum menusu ile CAPTCHA ayni karede gorunebilir. CAPTCHA'nin
+                # zaman asimina ugramamasi icin once solver'a bu kareyi ver;
+                # CAPTCHA yoksa eski davranisla model ve mesaj akisini atla.
+                if death_visible:
+                    continue
+
+                # Dunyadaki sabit detaylari seyrek optik akisla izle. Yerel mob ve
+                # beceri animasyonlari yerine genis alana yayilan tutarli kayma aranir.
+                try:
+                    scene_motion = self._measure_scene_motion(pk, img, time.time())
+                except Exception:
+                    scene_motion = {
+                        "ready": False, "moving": False, "score": 0.0,
+                        "confidence": 0.0, "points": 0,
+                    }
 
                 if self._handle_message_request(ci, pk, img, ox, oy, hwnd, cc):
                     continue
@@ -4778,6 +4882,128 @@ class API:
         self._terminal_logs = deque(maxlen=800)
         self._terminal_file_offsets = {}
         self._terminal_lock = threading.Lock()
+        self._maintenance = False
+        self._maintenance_resume = None
+        self._maintenance_complete = False
+        self._pending_resume = None
+        self._startup_gate = bool(os.environ.get("PHANTOM_MANAGED_RUN"))
+
+    def _config_signature(self):
+        with self.cfg.lk:
+            value = json.dumps(self.cfg.d, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def _resume_clients(self):
+        import win32process
+        clients = []
+        configs = {ci: self.cfg.client(ci) for ci in CLIENT_IDS}
+        if duplicate_client_ids(configs):
+            raise ValueError("Ayni pencere birden fazla client'a atanmis")
+        for ci, cc in configs.items():
+            if not cc.get("aktif", True):
+                continue
+            hwnd = hwnd_al(cc.get("pencere"))
+            if not hwnd or not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd):
+                raise ValueError(f"Client {ci} penceresi hazir degil")
+            model = cc.get("model_yolu") or self.cfg.g("model_yolu")
+            if not model or not os.path.isfile(model):
+                raise ValueError(f"Client {ci} modeli bulunamadi")
+            if not (cc.get("hp_region_custom") and cc.get("hp_region")):
+                raise ValueError(f"Client {ci} HP ayari eksik")
+            clients.append({"client": ci, "hwnd": hwnd,
+                "pid": win32process.GetWindowThreadProcessId(hwnd)[1],
+                "title": win32gui.GetWindowText(hwnd),
+                "rect": list(win32gui.GetWindowRect(hwnd))})
+        if not clients:
+            raise ValueError("Aktif istemci yok")
+        return clients
+
+    def quiesce_for_update(self, force=False):
+        """Stop bot workers cooperatively. Never terminate game processes."""
+        if not self._toggle_lock.acquire(blocking=False):
+            return {"ok": False, "reason": "Baslat/durdur islemi mesgul"}
+        try:
+            if self._maintenance_complete:
+                return {"ok": True, "resume": self._maintenance_resume or {}}
+            if not input_transaction_lock.acquire(timeout=.1):
+                return {"ok": False, "reason": "Giris isleminin bitmesi bekleniyor"}
+            try:
+                if not self._maintenance:
+                    with self.st.lk:
+                        active = self.st.aktif
+                        blocked = (self.st.global_pause_active or self.st.captcha_global_active
+                                   or self.st.message_global_active)
+                    action = self._at
+                    busy = action and (
+                        getattr(action, "_revive_state", {})
+                        or any(action._buff_running.values())
+                        or any(action._loot_running.values())
+                        or any(action._buff_needs_remount.values())
+                        or any(state not in ("ARANIYOR", "BEKLIYOR") for state in action.dur.values()))
+                    if not force and active and (blocked or busy):
+                        return {"ok": False, "reason": "Savas/canlanma/giris islemi bitince guncellenecek"}
+                    resume = {"active": bool(active and not force)}
+                    if resume["active"]:
+                        resume.update(clients=self._resume_clients(), config=self._config_signature(),
+                            buff_next=dict(action._buff_next_t) if action else {},
+                            kills=dict(self.st.kill_counts))
+                    self._maintenance_resume = resume
+                    self._maintenance = True
+                with self.st.lk:
+                    self.st.aktif = False
+                    self.st.started_at = 0
+                workers = [worker for worker in (self._at, self._vt) if worker]
+                for worker in workers:
+                    worker.stop()
+            finally:
+                input_transaction_lock.release()
+            deadline = time.monotonic() + 12
+            for worker in workers:
+                worker.join(timeout=max(0, deadline-time.monotonic()))
+            if any(worker.is_alive() for worker in workers):
+                return {"ok": False, "reason": "Eski bot is parcacigi henuz kapanmadi; yeni bot acilmayacak"}
+            if self._vt:
+                for watcher in getattr(self._vt, "captcha_w", {}).values():
+                    job = getattr(watcher, "_rumeli2_job_thread", None)
+                    if job and job.is_alive():
+                        return {"ok": False, "reason": "Arka plan isi henuz kapanmadi"}
+            with input_transaction_lock:
+                for key in ("space", "w", "a", "s", "d", "q", "g", "t", "z",
+                            "1", "2", "3", "4", "f1", "f2", "f3", "f4", "ctrl", "alt", "shift"):
+                    keyboard.release(key)
+            if self._diagnostic_recorder:
+                self._diagnostic_recorder.stop()
+                self._diagnostic_recorder.join(timeout=5)
+                if self._diagnostic_recorder.is_alive():
+                    return {"ok": False, "reason": "Video kaydinin kapanmasi bekleniyor"}
+            self._at = self._vt = None
+            self._maintenance_complete = True
+            log_event(self.st, "info", "[UPDATE] Bot ve kayit guvenle durduruldu")
+            return {"ok": True, "resume": self._maintenance_resume}
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
+        finally:
+            self._toggle_lock.release()
+
+    def resume_after_update(self, resume):
+        if not resume.get("active"):
+            self._startup_gate = False
+            return {"ok": True}
+        try:
+            if resume.get("config") != self._config_signature():
+                raise ValueError("Ayarlar degisti; otomatik devam edilmedi")
+            if resume.get("clients") != self._resume_clients():
+                raise ValueError("Oyun pencereleri degisti; otomatik devam edilmedi")
+            self._pending_resume = resume
+            if not self._toggle(source="guvenli guncelleme"):
+                raise ValueError("Bot baslatilamadi")
+            return {"ok": True}
+        except Exception as exc:
+            log_event(self.st, "warn", f"[UPDATE] {exc}")
+            return {"ok": False, "reason": str(exc)}
+        finally:
+            self._pending_resume = None
+            self._startup_gate = False
 
     def _append_terminal_log(self, level, message, ts=None):
         entry = {
@@ -4890,6 +5116,8 @@ class API:
         return result
     def get_client(self, idx): return self.cfg.client(idx)
     def save_client(self, idx, data):
+        if self._maintenance:
+            return {"ok": False, "error": "Guncelleme icin kapaniliyor"}
         try:
             ci = int(idx)
         except (TypeError, ValueError):
@@ -4909,6 +5137,8 @@ class API:
         return {"ok": True}
     def save_global(self, data):
         global _force_sendinput
+        if self._maintenance:
+            return {"ok": False, "error": "Guncelleme icin kapaniliyor"}
         incoming = dict(data or {})
         self.cfg.update_global(incoming)
         if "diagnostic_video_enabled" in incoming and self._diagnostic_recorder is not None:
@@ -5328,6 +5558,13 @@ class API:
             self._toggle_lock.release()
 
     def _toggle_locked(self, source="UI"):
+        if self._maintenance:
+            return False
+        if self._startup_gate and source != "guvenli guncelleme":
+            return False
+        if not self.st.aktif and any(th and th.is_alive() for th in (self._at, self._vt)):
+            log_event(self.st, "warn", "Onceki bot is parcacigi kapanmadan yeniden baslatilamaz")
+            return False
         with self.st.lk:
             was_active = self.st.aktif
             self.st.aktif = not self.st.aktif
@@ -5364,22 +5601,28 @@ class API:
                 log_event(self.st, "info", "Tiklama modu: SendInput")
             self._vt   = VisionThread(self.cfg, self.st)
             self._at   = ActionThread(self.cfg, self.st)
+            if self._pending_resume:
+                self._at._buff_next_t.update(self._pending_resume.get("buff_next", {}))
+                with self.st.lk:
+                    self.st.kill_counts.update(self._pending_resume.get("kills", {}))
             self._vt.start(); self._at.start()
         elif was_active and not a:
             for th in (self._at, self._vt):
                 if th:
                     th.stop()
-            if self._vt:
-                self._vt._unload_ocr()
             for th in (self._at, self._vt):
                 if th:
                     th.join(timeout=1.5)
-            self._vt   = None
-            self._at   = None
+            if self._vt and not self._vt.is_alive():
+                self._vt._unload_ocr()
+                self._vt = None
+            if self._at and not self._at.is_alive():
+                self._at = None
         return True
 
 def main():
     print("[STARTUP] Uygulama ana baslangicina girdi.", flush=True)
+    instance_lock = InstanceLock(os.path.join(RUNTIME_DIR, "manager", "app.lock")).acquire()
     _cleanup_runtime_dir(LOG_DIR, LOG_RETENTION_DAYS, keep_suffixes=(".jsonl",))
     _cleanup_runtime_dir(EVIDENCE_DIR, EVIDENCE_RETENTION_DAYS, keep_suffixes=(".png", ".json"))
     cfg = Cfg(); state = State()
@@ -5394,8 +5637,11 @@ def main():
     # F5 hotkey - key-up olayÄ±na baÄŸlÄ± kalmadan debounce ile Ã§alÄ±ÅŸÄ±r.
     _f5_last_t = 0.0
     _f5_lock = threading.Lock()
+    app_stopping = threading.Event()
     def _trigger_f5_toggle(source):
         nonlocal _f5_last_t
+        if app_stopping.is_set() or api._maintenance:
+            return
         now = time.time()
         with _f5_lock:
             if now - _f5_last_t < 0.35:
@@ -5412,7 +5658,7 @@ def main():
 
     def _f5_poll_loop():
         was_down = False
-        while True:
+        while not app_stopping.is_set():
             try:
                 down = bool(win32api.GetAsyncKeyState(0x74) & 0x8000)
                 if down and not was_down:
@@ -5424,7 +5670,10 @@ def main():
                 time.sleep(1.0)
     threading.Thread(target=_f5_poll_loop, daemon=True).start()
     # SHIFT+SOL TIK iÃ§in hotkey (normal tÄ±klamayÄ± engelle, bot tÄ±klamasÄ±nÄ± kullan)
-    keyboard.add_hotkey('shift+left', sol_tik_hw_shift_callback, suppress=True)
+    def _safe_shift_click():
+        if not app_stopping.is_set() and not api._maintenance:
+            sol_tik_hw_shift_callback()
+    keyboard.add_hotkey('shift+left', _safe_shift_click, suppress=True)
     print("[STARTUP] WebView penceresi tanimlaniyor.", flush=True)
     window = webview.create_window(
         title="PHANTOM",
@@ -5434,12 +5683,28 @@ def main():
         height=620,
         resizable=True,
     )
+    managed_run = os.environ.get("PHANTOM_MANAGED_RUN")
+    lifecycle = ManagedLifecycle(api, window, managed_run) if managed_run else None
+    if lifecycle:
+        window.events.loaded += lifecycle.on_loaded
+        window.events.closing += lifecycle.on_closing
+        lifecycle.start()
+    else:
+        def _on_closing():
+            return api.quiesce_for_update(force=True).get("ok", False)
+        window.events.closing += _on_closing
     print("[STARTUP] WebView olay dongusu baslatiliyor.", flush=True)
     try:
         webview.start(debug=False)
     finally:
+        app_stopping.set()
+        keyboard.unhook_all()
+        if lifecycle:
+            lifecycle.close()
+        api.quiesce_for_update(force=True)
         diagnostic_recorder.stop()
         diagnostic_recorder.join(timeout=3.0)
+        instance_lock.close()
 
 if __name__ == '__main__':
     main()

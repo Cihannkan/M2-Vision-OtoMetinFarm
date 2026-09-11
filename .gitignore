@@ -12,6 +12,7 @@ runtime/evidence/*
 runtime/captcha_kontrol/*
 !runtime/captcha_kontrol/.gitkeep
 runtime/easyocr_models/
+runtime/manager/
 
 # User-specific HP selections
 templates/hp_templates/*

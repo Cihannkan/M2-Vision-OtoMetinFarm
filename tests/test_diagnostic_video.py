@@ -17,6 +17,23 @@ from src.phantom.diagnostic_video import (
 
 
 class DiagnosticVideoTests(unittest.TestCase):
+    def test_default_recording_rotates_after_one_minute(self):
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = DiagnosticVideoRecorder(folder, enabled=True)
+            self.assertEqual(recorder.segment_seconds, 60)
+            frame = np.zeros((240, 320, 3), dtype=np.uint8)
+            monitor = {"left": 0, "top": 0, "width": 320, "height": 240}
+            try:
+                recorder._write_frame(frame, 1700000000.0, monitor, {})
+                first = recorder.status()["current_file"]
+                recorder._write_frame(frame, 1700000059.5, monitor, {})
+                self.assertEqual(recorder.status()["current_file"], first)
+                recorder._write_frame(frame, 1700000060.0, monitor, {})
+                self.assertNotEqual(recorder.status()["current_file"], first)
+                self.assertGreater(Path(first).stat().st_size, 0)
+            finally:
+                recorder._close_segment()
+
     def test_frame_size_is_bounded_and_even(self):
         self.assertEqual(fit_even_frame_size(2048, 833, 1280, 720), (1280, 520))
         width, height = fit_even_frame_size(801, 601, 1280, 720)

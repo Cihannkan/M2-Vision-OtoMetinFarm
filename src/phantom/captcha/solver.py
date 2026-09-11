@@ -11,8 +11,9 @@ import win32gui
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_PACKAGE_DIR, "..", "..", ".."))
+_DATA_ROOT = os.path.abspath(os.environ.get("PHANTOM_DATA_ROOT") or _PROJECT_ROOT)
 _SCRIPT_DIR = _PROJECT_ROOT
-_RUNTIME_DIR = os.path.join(_PROJECT_ROOT, "runtime")
+_RUNTIME_DIR = os.path.join(_DATA_ROOT, "runtime")
 _EASYOCR_REQUIRED_MODEL_FILES = ("craft_mlt_25k.pth", "latin_g2.pth")
 _EASYOCR_INIT_LOCK = threading.Lock()
 _RUMELI2_PANEL_MIN_SCORE = 0.18
@@ -1138,12 +1139,22 @@ class CaptchaWatcher:
 
     def _rumeli2_panel_reference(self, question_region, option_regions):
         client_id = int(getattr(self, "_client_id", 0) or 0)
-        template_dir = os.path.join(_PROJECT_ROOT, "templates", "rumeli2_captcha")
-        candidate_paths = [
-            os.path.join(template_dir, "shared.png"),
-            os.path.join(template_dir, f"client_{client_id}.png"),
-            os.path.join(template_dir, "client_1.png"),
-        ]
+        # Managed PHANTOM runs execute from an immutable release snapshot. User
+        # calibration images are deliberately not copied into that snapshot,
+        # so resolve them from PHANTOM_DATA_ROOT first. The project-root fallback
+        # keeps direct development/test launches working as before.
+        template_roots = []
+        for root in (_DATA_ROOT, _PROJECT_ROOT):
+            template_dir = os.path.join(root, "templates", "rumeli2_captcha")
+            if template_dir not in template_roots:
+                template_roots.append(template_dir)
+        candidate_paths = []
+        for template_dir in template_roots:
+            candidate_paths.extend((
+                os.path.join(template_dir, "shared.png"),
+                os.path.join(template_dir, f"client_{client_id}.png"),
+                os.path.join(template_dir, "client_1.png"),
+            ))
         reference_path = next((path for path in candidate_paths if os.path.exists(path)), None)
         try:
             reference_mtime = os.path.getmtime(reference_path) if reference_path else 0.0
@@ -1558,21 +1569,44 @@ class CaptchaWatcher:
         return primary, cleaned
 
     @staticmethod
-    def _rumeli2_candidate_ocr_match(question_digits, option_candidates, scores):
-        """Match the target against retained OCR candidates without guessing."""
-        target = str(question_digits or "")
-        if not re.fullmatch(r"\d{6}", target):
-            return None
+    def _rumeli2_candidate_ocr_pair(
+        question_digits,
+        option_candidates,
+        scores,
+        question_candidates=None,
+    ):
+        """Return the only safe target/option intersection retained by OCR."""
         if len(option_candidates or []) != 4 or len(scores or []) != 4:
             return None
-        matches = [
-            idx
-            for idx, candidates in enumerate(option_candidates)
-            if target in set(str(value or "") for value in (candidates or []))
-        ]
-        if len(matches) != 1:
+
+        raw_targets = [question_digits]
+        if isinstance(question_candidates, (list, tuple, set)):
+            raw_targets.extend(question_candidates)
+        elif question_candidates:
+            raw_targets.append(question_candidates)
+        targets = []
+        for value in raw_targets:
+            value = str(value or "")
+            if re.fullmatch(r"\d{6}", value) and value not in targets:
+                targets.append(value)
+        if not targets:
             return None
-        selected = matches[0]
+
+        intersections = []
+        for target in targets:
+            for idx, candidates in enumerate(option_candidates):
+                cleaned = {
+                    str(value or "")
+                    for value in (candidates or [])
+                    if re.fullmatch(r"\d{6}", str(value or ""))
+                }
+                pair = (target, idx)
+                if target in cleaned and pair not in intersections:
+                    intersections.append(pair)
+        if len(intersections) != 1:
+            return None
+
+        target, selected = intersections[0]
         selected_score = float(scores[selected])
         best_score = max(float(score) for score in scores)
         if (
@@ -1580,10 +1614,39 @@ class CaptchaWatcher:
             or best_score - selected_score > _RUMELI2_NEAR_MATCH_MAX_SHAPE_GAP
         ):
             return None
-        return selected
+        return target, selected
 
-    def _rumeli2_confirm_candidate_match(self, question_digits, option_candidates, scores):
-        selected = self._rumeli2_candidate_ocr_match(question_digits, option_candidates, scores)
+    @staticmethod
+    def _rumeli2_candidate_ocr_match(
+        question_digits,
+        option_candidates,
+        scores,
+        question_candidates=None,
+    ):
+        """Match retained OCR candidates without guessing between alternatives."""
+        match = CaptchaWatcher._rumeli2_candidate_ocr_pair(
+            question_digits,
+            option_candidates,
+            scores,
+            question_candidates,
+        )
+        return match[1] if match is not None else None
+
+    def _rumeli2_confirm_candidate_match(
+        self,
+        question_digits,
+        option_candidates,
+        scores,
+        question_candidates=None,
+    ):
+        match = self._rumeli2_candidate_ocr_pair(
+            question_digits,
+            option_candidates,
+            scores,
+            question_candidates,
+        )
+        matched_digits = match[0] if match is not None else ""
+        selected = match[1] if match is not None else None
         now = time.monotonic()
         key = ""
         streak = 0
@@ -1591,7 +1654,7 @@ class CaptchaWatcher:
             selected_candidates = sorted(
                 set(str(value or "") for value in (option_candidates[selected] or []))
             )
-            key = f"{question_digits}|{selected}|{','.join(selected_candidates)}"
+            key = f"{matched_digits}|{selected}|{','.join(selected_candidates)}"
         with self._lock:
             previous_key = getattr(self, "_rumeli2_candidate_match_key", "")
             previous_at = float(getattr(self, "_rumeli2_candidate_match_last", 0.0) or 0.0)
@@ -1702,6 +1765,7 @@ class CaptchaWatcher:
                 question_digits,
                 option_candidates,
                 scores,
+                question_candidates,
             )
             if selected is not None:
                 best_score = scores[selected]
@@ -1848,7 +1912,7 @@ class CaptchaWatcher:
             self._rumeli2_detect_streak = 0
             error = self._rumeli2_candidate_error or "rumeli2_kalibrasyon_yok"
             detail = (
-                "ortak panel referansi gerekli"
+                f"referans bulunamadi: {os.path.join(_DATA_ROOT, 'templates', 'rumeli2_captcha')}"
                 if error == "rumeli2_referans_yok"
                 else "soru + 4 secenek alani gerekli"
             )

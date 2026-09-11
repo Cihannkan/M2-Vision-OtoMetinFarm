@@ -78,7 +78,8 @@ class ClientRoutingTests(unittest.TestCase):
     def test_client_three_ui_and_default_config_exist(self):
         root = Path(__file__).resolve().parents[1]
         html = (root / "index.html").read_text(encoding="utf-8-sig")
-        config = json.loads((root / "config_phantom.json").read_text(encoding="utf-8-sig"))
+        from src.phantom.app.main import VARSAYILAN
+        config = VARSAYILAN
         self.assertIn("const CLIENT_IDS = [1, 2, 3]", html)
         for element_id in (
             "client3Toggle", "win3", "mdl3", "hpReady3", "hpFillReady3",
@@ -86,8 +87,7 @@ class ClientRoutingTests(unittest.TestCase):
         ):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("c3", config)
-        # config_phantom.json calisan kullanici ayaridir; Client 3 kullanici
-        # tarafindan acilmis olabilir. Test bu tercihi kapaliya zorlamamali.
+        # User settings must not be required by an isolated release test.
         self.assertIsInstance(config["c3"].get("aktif"), bool)
 
 

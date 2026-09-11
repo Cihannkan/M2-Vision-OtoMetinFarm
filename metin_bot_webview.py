@@ -14,7 +14,8 @@ _OUTPUT_HANDLES = []
 def _redirect_output_for_gui_launch():
     if os.environ.get("PHANTOM_GUI_LAUNCH") != "1":
         return
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime", "logs")
+    data_root = os.environ.get("PHANTOM_DATA_ROOT", os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(data_root, "runtime", "logs")
     os.makedirs(log_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(log_dir, f"phantom_stdout_{stamp}.log")

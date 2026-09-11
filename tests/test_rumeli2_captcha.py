@@ -8,6 +8,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from src.phantom.captcha import solver as solver_module
 from src.phantom.captcha.solver import CaptchaWatcher, captcha_status_blocks_input
 
 
@@ -184,6 +185,34 @@ class Rumeli2CaptchaTests(unittest.TestCase):
         self.assertFalse(watcher._rumeli2_candidate(frame))
         self.assertEqual(watcher._rumeli2_candidate_error, "rumeli2_referans_yok")
 
+    def test_panel_reference_uses_managed_data_root(self):
+        question_region = [0.30, 0.36, 0.40, 0.60]
+        option_regions = [
+            [0.42 + index * 0.08, 0.47 + index * 0.08, 0.40, 0.60]
+            for index in range(4)
+        ]
+        watcher = self._watcher(question_region, option_regions)
+        watcher._client_id = 2
+        reference = np.full((240, 320, 3), 28, dtype=np.uint8)
+
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            data_root = base / "data"
+            release_root = base / "release"
+            template_dir = data_root / "templates" / "rumeli2_captcha"
+            template_dir.mkdir(parents=True)
+            release_root.mkdir()
+            self.assertTrue(cv2.imwrite(str(template_dir / "client_1.png"), reference))
+
+            with patch.object(solver_module, "_DATA_ROOT", str(data_root)), patch.object(
+                solver_module, "_PROJECT_ROOT", str(release_root)
+            ):
+                gray, mask = watcher._rumeli2_panel_reference(question_region, option_regions)
+
+        self.assertIsNotNone(gray)
+        self.assertIsNotNone(mask)
+        self.assertEqual(gray.shape, mask.shape)
+
     def test_ocr_job_does_not_block_the_vision_caller(self):
         watcher = self._watcher()
         watcher._rumeli2_read_digits = lambda *_args, **_kwargs: "123456"
@@ -302,6 +331,48 @@ class Rumeli2CaptchaTests(unittest.TestCase):
         self.assertEqual(first["option_candidates"][1], ["186287", "862871"])
         self.assertEqual(second["selected"], 1)
         self.assertEqual(second["reason"], "iki-kare-aday-ocr+sekil")
+
+    def test_recorded_blank_primary_question_uses_unique_candidate_after_two_votes(self):
+        watcher = self._watcher()
+        question = np.zeros((8, 8, 3), dtype=np.uint8)
+        options = [np.full_like(question, value) for value in (1, 2, 3, 4)]
+        masks = [np.full((8, 8), value, dtype=np.uint8) for value in (1, 2, 3, 4)]
+        readings = {
+            id(question): ("", ["501410", "601410"]),
+            id(options[0]): ("501410", ["501410"]),
+            id(options[1]): ("276072", ["276072"]),
+            id(options[2]): ("", ["126147", "261470"]),
+            id(options[3]): ("", ["133251", "332513"]),
+        }
+        shape_scores = {
+            id(mask): score
+            for mask, score in zip(masks, (0.4363, 0.2598, 0.3454, 0.3079))
+        }
+        watcher._rumeli2_read_digits = lambda crop, **_kwargs: readings[id(crop)]
+        watcher._rumeli2_mask_similarity = lambda _question, mask: shape_scores[id(mask)]
+        candidate = {
+            "question_crop": question,
+            "question_mask": np.zeros((8, 8), dtype=np.uint8),
+            "option_crops": options,
+            "option_masks": masks,
+        }
+
+        first = watcher._rumeli2_ocr_decision(candidate)
+        second = watcher._rumeli2_ocr_decision(candidate)
+
+        self.assertIsNone(first["selected"])
+        self.assertEqual(first["candidate_match_streak"], 1)
+        self.assertEqual(second["selected"], 0)
+        self.assertEqual(second["reason"], "iki-kare-aday-ocr+sekil")
+
+    def test_candidate_ocr_refuses_two_question_candidates_matching_two_options(self):
+        selected = CaptchaWatcher._rumeli2_candidate_ocr_match(
+            "",
+            [["501410"], ["601410"], ["126147"], ["332513"]],
+            [0.44, 0.42, 0.35, 0.31],
+            ["501410", "601410"],
+        )
+        self.assertIsNone(selected)
 
     def test_candidate_ocr_refuses_target_found_in_multiple_options(self):
         selected = CaptchaWatcher._rumeli2_candidate_ocr_match(

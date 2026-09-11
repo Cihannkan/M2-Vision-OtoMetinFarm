@@ -51,10 +51,10 @@ if errorlevel 1 (
 call :launcher_log "Python ortami hazir; agir kutuphaneler uygulama icinde yuklenecek."
 
 set "PHANTOM_GUI_LAUNCH=1"
-set "PHANTOM_ENTRY=%~dp0metin_bot_webview.py"
+set "PHANTOM_ENTRY=%~dp0phantom_supervisor.py"
 set "PHANTOM_ROOT=%~dp0"
 call :launcher_log "GUI sureci baslatiliyor: %VENV_PYW%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $q=[char]34; $entryArg=$q+$env:PHANTOM_ENTRY+$q; $p=Start-Process -FilePath $env:VENV_PYW -ArgumentList $entryArg -WorkingDirectory $env:PHANTOM_ROOT -PassThru; Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] GUI PID='+$p.Id); Start-Sleep -Seconds 12; if($p.HasExited){Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] HATA: GUI sureci erken kapandi. Cikis kodu='+$p.ExitCode); exit 1}; Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] GUI sureci 12 saniye sonra calisiyor.')" >> "%LAUNCH_LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $q=[char]34; $entryArg=$q+$env:PHANTOM_ENTRY+$q; $p=Start-Process -FilePath $env:VENV_PYW -ArgumentList $entryArg -WorkingDirectory $env:PHANTOM_ROOT -WindowStyle Hidden -PassThru; Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] GUI PID='+$p.Id); Start-Sleep -Seconds 12; if($p.HasExited){Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] HATA: GUI sureci erken kapandi. Cikis kodu='+$p.ExitCode); exit 1}; Write-Output ('['+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')+'] GUI sureci 12 saniye sonra calisiyor.')" >> "%LAUNCH_LOG%" 2>&1
 if errorlevel 1 (
     call :launcher_log "HATA: GUI sureci baslatilamadi veya erken kapandi."
     call :show_error "PHANTOM penceresi baslatilamadi. Ayrinti: runtime\logs\launcher_latest.log"
