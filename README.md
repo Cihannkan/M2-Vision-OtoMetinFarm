@@ -1,8 +1,9 @@
 # PHANTOM Bot
 
-> Windows üzerinde çalışan, PyWebView arayüzlü, YOLO tabanlı çift istemci otomasyon projesi.
+> Windows üzerinde çalışan, PyWebView arayüzlü, YOLO tabanlı üç istemcili otomasyon projesi.
 > Hedef algılama, HP takibi, hedef kuyruğu, otomatik loot, mesaj koruması, CAPTCHA modülleri,
-> canlı debug görüntüsü ve ayrıntılı log sistemi tek arayüzde toplanır.
+> canlı debug görüntüsü, tanı videosu, kurtarma davranışları ve ayrıntılı log sistemi tek
+> arayüzde toplanır. Uygulama, kontrollü güncelleme ve geri dönüş için bir supervisor ile çalışır.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-lightgrey)
@@ -27,6 +28,8 @@
 - [Model ve Şablon Dosyaları](#model-ve-şablon-dosyaları)
 - [Dosya Yapısı](#dosya-yapısı)
 - [Ayarlar ve Loglar](#ayarlar-ve-loglar)
+- [Sürüm Yönetimi ve Kontrollü Güncellemeler](#sürüm-yönetimi-ve-kontrollü-güncellemeler)
+- [Navigasyon Prototipi (Deneysel)](#navigasyon-prototipi-deneysel)
 - [Güvenlik ve Antivirüs](#güvenlik-ve-antivirüs)
 - [Sorun Giderme](#sorun-giderme)
 - [Geliştirici Notları](#geliştirici-notları)
@@ -39,6 +42,8 @@
 PHANTOM Bot, en fazla üç ayrı oyun istemcisini aynı panelden yönetmek için tasarlanmış bir otomasyon aracıdır. Her client için ayrı model, pencere, HP paneli ve canlı debug görüntüsü tutulur. Bot, ekrandaki hedefleri YOLO modeli ile algılar, HP durumuna göre savaş akışını takip eder, hedef öldüğünde loot toplar ve istatistikleri arayüzde gösterir.
 
 Projenin hedefi, başka bir Windows bilgisayarda da minimum manuel işlemle çalışmaktır. Bu yüzden kurulum akışı `.venv` tabanlıdır; sistem Python ortamını kirletmez, eksik Python sürümünü indirir, gerekli paketleri kurar ve sonunda gerçek import testi yapar.
+
+Uygulama tek başına çalışmaz; `phantom_supervisor.py` tarafından denetlenir. Supervisor, kaynak koddan sürüm kopyası hazırlar, yerel regresyon testlerini çalıştırır, uygulama sağlığını izler ve aday sürüm açılışta hata verirse önceki sürümü bir kez geri getirir. Protokolün ayrıntısı [`docs/CONTROLLED_UPDATES.md`](docs/CONTROLLED_UPDATES.md) dosyasındadır.
 
 Bilinen davranışlar, kanıtlar ve canlı kabul ölçütleri tek yerde
 [`docs/PHANTOM_CASES.md`](docs/PHANTOM_CASES.md) dosyasında izlenir.
@@ -64,6 +69,8 @@ Bilinen davranışlar, kanıtlar ve canlı kabul ölçütleri tek yerde
 | Mesaj Koruması | Mesaj penceresi veya bildirim algılanınca kısa süre işlem önceliğini mesaja verip cevap göndermeye çalışır. | Uzun süreli kullanımda beklenmeyen mesaj pencereleri için faydalıdır. |
 | Kurulum BAT Akışı | Python, sanal ortam, Torch, WebView2 ve paket kontrollerini tek dosyada toplar. | Projeyi başka PC’ye taşırken en kritik yardımcıdır. |
 | Log Sistemi | Kurulum ve çalışma zamanı olaylarını dosyaya yazar. | Kullanıcı destek verirken “bende çalışmıyor” durumunu somut hataya çevirir. |
+| Tanı Videosu | Masaüstünü 2 FPS hızında, sessiz ve 5 dakikalık parçalarla kaydeder; JSONL kanıtla eşler. | “O an ne oldu?” sorusunu arşivden yanıtlamak için. |
+| Kontrollü Güncelleme | Yeni sürüm, test edilmiş kopya olarak güvenli geçişle devreye girer; hata durumunda önceki sürüm geri gelir. | Çalışan botu kesintiye uğratmadan kod güncellemek için. |
 
 ---
 
@@ -76,7 +83,7 @@ Bilinen davranışlar, kanıtlar ve canlı kabul ölçütleri tek yerde
 - Her client için model dosyası seçilebilir.
 - Her client için HP panel alanı ayrı kaydedilir.
 - Canlı görüntü ve debug aç/kapat kontrolü client bazlıdır.
-- Ayarlar üstteki `C1 ON/OFF` ve `C2 ON/OFF` düğmeleriyle hızlıca değiştirilebilir.
+- Ayarlar üstteki `C1 ON/OFF`, `C2 ON/OFF` ve `C3 ON/OFF` düğmeleriyle hızlıca değiştirilebilir.
 
 ### YOLO Tabanlı Hedef Algılama
 
@@ -397,6 +404,45 @@ Bot otomatik olarak SendInput moduna düşer. Bu durumda:
 
 ---
 
+## Sürüm Yönetimi ve Kontrollü Güncellemeler
+
+PHANTOM, `phantom_supervisor.py` tarafından yönetilen iki katmanlı bir yapıyla çalışır:
+
+1. **Supervisor**: Sürümden sorumlu yönetici süreç. Kaynak koddan `runtime/manager/releases/` altına sürüm kopyası hazırlar, yerel testleri çalıştırır, uygulamayı başlatır ve sağlık bilgisini izler.
+2. **Uygulama**: `metin_bot_webview.py`, `src/phantom/` ve `index.html` ikilisi. Oyun otomasyonu ve arayüz burada çalışır.
+
+### Komutlar
+
+```text
+.venv\Scripts\python.exe phantom_supervisor.py run      # varsayılan; uygulamayı yöneterek başlatır
+.venv\Scripts\python.exe phantom_supervisor.py update   # yeni sürüm isteği: kopyala + test + güvenli geçiş
+.venv\Scripts\python.exe phantom_supervisor.py status   # yönetici durumunu yaz
+```
+
+### Güvenli geçiş kuralları
+
+- `PHANTOM.bat` uygulamayı supervisor üzerinden başlatır.
+- Güncelleme isteği yalnızca yerel kontrol dosyasına yazılır; ağ servisi, uzaktan komut veya GitHub gönderimi yoktur.
+- Aday sürümün testleri geçememesi durumunda çalışan bot durdurulmaz.
+- Savaş/canlanma/güçlendirme/loot ve global duraklama yokken güvenli geçiş beklenir (en fazla yaklaşık iki dakika); tuşlar bırakılır, video dosyası kapatılır, eski uygulama tamamen çıkmadan yenisi açılmaz.
+- Yeni sürüm aynı ayarları ve oyun pencerelerini (HWND, PID, başlık, konum) doğrular; uyuşmazlıkta uygulama açık fakat bot duraklatılmış kalır. Aktif botun güçlendirme zamanları ve kesim sayıları korunur.
+- Yeni sürüm açılışta hata verip kapanırsa önceki sürüm bir kez geri açılır.
+
+Ayrıntılı protokol: [`docs/CONTROLLED_UPDATES.md`](docs/CONTROLLED_UPDATES.md).
+
+### `runtime/manager/` kayıtları
+
+| Yol | İçerik |
+| --- | --- |
+| `runtime/manager/status.json` | Yönetici durumu ve sürüm yolu. |
+| `runtime/manager/tests_latest.log` | Son test çıktısı. |
+| `runtime/manager/runs/` | Uygulama sağlık bilgisi ve geçiş kayıtları. |
+| `runtime/manager/releases/` | Kaynak/test/yerleşik şablon kopyaları. |
+
+Bu klasör Git tarafından yok sayılır; sürüm kopyaları otomatik silinmez, uzun süreli kullanımda disk boyutu kontrol edilmelidir. Modeller, kişisel ayarlar ve çalışma videoları sürüm kopyasına alınmaz.
+
+---
+
 ## CAPTCHA ve Mesaj Koruması
 
 CAPTCHA sistemi `src/phantom/captcha/solver.py` içinde yer alır ve `CaptchaWatcher` sınıfı ile çalışır.
@@ -432,12 +478,31 @@ RUMELİ2 ilk kullanımında `Ayarlar > Güvenlik` bölümünden CAPTCHA'nın gö
 
 ---
 
+## Navigasyon Prototipi (Deneysel)
+
+`src/phantom/navigation/coordinates.py`, ekran görüntüsündeki koordinat balonunu yerel EasyOCR modelleriyle okuyan çevrimdışı bir prototiptir. Aşama 1 itibarıyla bu modül çalışan bot tarafından çağrılmaz; fare/klavye girdisi, ekran yakalama ve hareket komutu içermez.
+
+- İki farklı ön işlem ve tam karakter adı uzlaşması kullanılır; yanlış isim, belirsiz/eksik yazı, düşük güven ve sınır dışı değerler reddedilir.
+- Her client için ayrı zaman/konum kapısı vardır; tek kare veya tekrarlanan kareler konumu doğrulamaz.
+- Model indirme kapalıdır; yerel `craft_mlt_25k.pth` ve `latin_g2.pth` kullanılır.
+
+Kayıtlı bir görüntü üzerinde denemek için:
+
+```powershell
+.venv\Scripts\python.exe -B tools\navigation_replay.py GORUNTU.png --name KARAKTER --roi SOL UST SAG ALT --bounds GENISLIK YUKSEKLIK --models MODEL_KLASORU --network-dir YEREL_AG_KLASORU
+```
+
+Durum, ölçümler ve bilinen sınırlar: [`docs/NAVIGATION_PHASE1.md`](docs/NAVIGATION_PHASE1.md).
+
+---
+
 ## Model ve Şablon Dosyaları
 
 ### Hazır Modeller
 
 | Dosya | Açıklama |
 | --- | --- |
+| `models/best.pt` (+ `models/best.onnx`) | Genel amaçlı model. `.onnx` sürümü varsa CUDA olmayan sistemlerde DirectML hızlandırması için kullanılır. |
 | `models/Büyülü_metni.pt` | Büyülü metin modeli. |
 | `models/Guatama_metni.pt` | Guatama metni modeli. |
 | `models/Gölge_metni.pt` | Gölge metni modeli. |
@@ -462,11 +527,12 @@ Model seçimi client bazlı yapılır. Yanlış model seçilirse hedef algılama
 PHANTOM_BOT/
 ├─ PHANTOM.bat
 ├─ kurulum.bat
+├─ phantom_supervisor.py
 ├─ metin_bot_webview.py
 ├─ captcha_solver.py
 ├─ interception.dll
 ├─ index.html
-├─ config_phantom.json
+├─ config_phantom.json (ilk çalıştırmada oluşur; Git'e girmez)
 ├─ lib/
 │  └─ interception/
 │     ├─ install-interception.exe
@@ -477,6 +543,7 @@ PHANTOM_BOT/
 │     │  └─ interception.dll
 │     └─ LICENSE.txt
 ├─ models/
+│  ├─ best.pt (+ best.onnx)
 │  ├─ Büyülü_metni.pt
 │  ├─ Guatama_metni.pt
 │  ├─ Gölge_metni.pt
@@ -485,17 +552,22 @@ PHANTOM_BOT/
 │  ├─ captcha_keypad/
 │  ├─ captcha_template/
 │  ├─ hp_templates/
-│  └─ message_templates/
+│  ├─ message_templates/
+│  └─ revive_*.png
 ├─ runtime/
 │  ├─ logs/
 │  ├─ evidence/
-│  └─ captcha_kontrol/
+│  ├─ captcha_kontrol/
+│  └─ manager/ (Git'e girmez)
 ├─ src/
 │  └─ phantom/
 │     ├─ app/
 │     ├─ captcha/
 │     ├─ automation/
-│     └─ vision/
+│     ├─ vision/
+│     └─ navigation/
+├─ tests/
+├─ tools/
 └─ docs/
    └─ screenshots/
 ```
@@ -507,11 +579,23 @@ PHANTOM_BOT/
 | `PHANTOM.bat` | Yönetici yetkisi ister, `.venv` yoksa kurulum yapar, botu başlatır. |
 | `kurulum.bat` | Tek tık kurulum dosyasıdır. Python, `.venv`, paketler ve WebView2 kontrolünü yapar. |
 | `metin_bot_webview.py` | Eski giriş noktasını koruyan launcher dosyasıdır. |
+| `phantom_supervisor.py` | Sürüm kopyası hazırlayan, test eden ve uygulamayı denetleyen yönetici süreç. |
 | `index.html` | PyWebView içinde çalışan arayüzdür. |
 | `interception.dll` | Çalışma zamanında yüklenen Interception kütüphanesi (`x64`). |
 | `lib/interception/` | Interception sürücü kurulum aracı, `x86`/`x64` kütüphaneleri ve lisans dosyası. |
 | `src/phantom/app/main.py` | Ana uygulama, state, thread’ler, API ve otomasyon akışı. |
+| `src/phantom/app/client_routing.py` | Client-pencere eşleme doğrulaması ve ortak CAPTCHA kalibrasyon yardımcıları. |
+| `src/phantom/vision/combat.py` | HP paneli konumu, güvenilirlik oyları, hedef sıralama ve sahne hareketi fonksiyonları. |
+| `src/phantom/vision/directml.py` | ONNX Runtime DirectML inference yolu ve PyTorch’a güvenli geri dönüş. |
+| `src/phantom/vision/survival.py` | Ölüm menüsü algılama ve client bazlı hedef hata geçmişi. |
+| `src/phantom/automation/buffs.py` | Periyodik güçlendirme (ALT+1…ALT+F3) tuş sırası. |
 | `src/phantom/captcha/solver.py` | CAPTCHA ve OCR çözüm motoru. |
+| `src/phantom/captcha/preload_models.py` | OCR model önyükleme yardımcısı. |
+| `src/phantom/navigation/coordinates.py` | Çevrimdışı koordinat okuma prototipi (deneysel; bot tarafından çağrılmaz). |
+| `src/phantom/diagnostic_video.py` | 2 FPS masaüstü tanı videosu ve JSONL kanıt yazımı. |
+| `src/phantom/lifecycle.py` | Uygulama–supervisor yerel protokolü (ağ yok, oyun girdisi yok). |
+| `tests/` | `unittest` tabanlı birim testler (güncel suite: 218 test). |
+| `tools/` | Geliştirme araçları; örn. `tools/navigation_replay.py`. |
 | `config_phantom.json` | Kullanıcı ayarlarını tutar. |
 
 ---
@@ -561,8 +645,8 @@ Bu proje açık kaynaklıdır. Aşağıdaki hash değerleri ile indirdiğiniz do
 
 | Dosya | SHA256 |
 | --- | --- |
-| `PHANTOM.bat` | `42B45798DBD01651B1287F6D4921E0DD7C809C5624DAE17BF98D2F90066B9C6D` |
-| `kurulum.bat` | `451D51C1E13D83018ADD73E1E0B765AC9DDE710C067606055CB222FB793CEF9A` |
+| `PHANTOM.bat` | `98421AF8B8BCCD1C7FB8D72686CEC16D205D2B1BFF9BC88E86909C8D994C212B` |
+| `kurulum.bat` | `F8AE1169E385F4FD7F1964EE1D838B1C48ED9A9A3B2AEC7EFB66B1806C24A1E7` |
 | `interception.dll` (kök) | `AB88164C11B1B48488772D4C3BFAA4509D5B0AE9DBC5A691DC4F96F0260443C8` |
 | `lib/interception/install-interception.exe` | `E137863A79DA797F08E7A137280FF2A123809044A888FD75CE9C973198915ABE` |
 | `lib/interception/x64/interception.dll` | `AB88164C11B1B48488772D4C3BFAA4509D5B0AE9DBC5A691DC4F96F0260443C8` |
@@ -680,10 +764,22 @@ Python sözdizimi kontrolü için:
 .venv\Scripts\python.exe -m compileall -q src captcha_solver.py metin_bot_webview.py
 ```
 
+### Testler
+
+Birim testler `tests/` klasöründedir; güncel suite 218 test içerir ve tamamen geçmektedir:
+
+```bat
+.venv\Scripts\python.exe -B -m unittest discover -s tests -p "test_*.py" -q
+```
+
+- Testler OCR, ekran yakalama ve oyun girdisini çoğunlukla taklit eder; gerçek oyunda güvenli geçişin kanıtı değildir.
+- `tests/*.npz` dosyaları kayıtlı oyun verisiyle çalışan replay testleri (HP, ölüm menüsü, savaş çapası) için kullanılır.
+
 ### Ana Thread’ler
 
 | Thread / Katman | Görev |
 | --- | --- |
+| Supervisor (ayrı süreç) | Sürüm kopyası, test, sağlık izleme ve güvenli geçiş yönetimi. |
 | VisionThread | Ekran yakalama, model inference, HP ve template kontrolleri. |
 | ActionThread | Durum makinesi, hedef seçimi, tıklama, loot ve kurtarma davranışı. |
 | CaptchaWatcher | CAPTCHA dialog algılama, OCR ve çözüm aksiyonları. |
