@@ -130,16 +130,3 @@ Adımlar:
 8. F5 baslat
 
 Bu kadar.
-
-
-═══════════════════════════════════════════════════════════════
-İLETİŞİM
-═══════════════════════════════════════════════════════════════
-
-Destek almak, sorun bildirmek veya yeni geliştirmelerden
-haberdar olmak isteyenler geliştiriciye Discord üzerinden
-ulaşabilir:
-
-https://***REMOVED***
-
-İyi oyunlar!
